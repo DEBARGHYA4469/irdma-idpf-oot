@@ -100,7 +100,7 @@ if ${BUILD_LIBFABRIC}; then
 	    --enable-udp=yes \
 	    --enable-tcp=yes \
 	    --enable-verbs=yes \
-	    --enable-psm3=dl \
+	    --enable-psm3=yes \
 	    --with-psm3-rv=yes
 	make -j"$(nproc)"
 	sudo make install
