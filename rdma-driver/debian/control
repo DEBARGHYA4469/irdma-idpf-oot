@@ -1,7 +1,7 @@
 Source: irdma-dkms
 Section: kernel
 Priority: optional
-Maintainer: Google LLC <support.google.com>
+Maintainer: Google LLC <support@google.com>
 Build-Depends: debhelper-compat (= 13), dkms
 Standards-Version: 4.5.0
 Homepage: http://support.google.com
