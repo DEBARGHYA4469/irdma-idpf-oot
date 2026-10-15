@@ -122,23 +122,26 @@ static int idpf_idc_init_aux_vport_dev(struct idpf_vport *vport)
 	if (!(le16_to_cpu(vport_msg->vport_flags) & VIRTCHNL2_VPORT_ENABLE_RDMA))
 		return 0;
 
-	vport->vdev_info = kzalloc(sizeof(*vdev_info), GFP_KERNEL);
-	if (!vport->vdev_info)
+	vdev_info = kzalloc(sizeof(*vdev_info), GFP_KERNEL);
+	if (!vdev_info)
 		return -ENOMEM;
 
 	cdev_info = vport->adapter->cdev_info;
 
-	vdev_info = vport->vdev_info;
 	vdev_info->vport_id = vport->vport_id;
 	vdev_info->netdev = vport->netdev;
 	vdev_info->core_adev = cdev_info->adev;
+	mutex_init(&vdev_info->iidc_notifier_lock);
 
 	err = idpf_plug_vport_aux_dev(cdev_info, vdev_info);
 	if (err) {
-		vport->vdev_info = NULL;
 		kfree(vdev_info);
 		return err;
 	}
+
+	idpf_vport_cfg_lock(adapter);
+	vport->vdev_info = vdev_info;
+	idpf_vport_cfg_unlock(adapter);
 
 	return 0;
 }
@@ -161,9 +164,9 @@ void idpf_idc_vdev_mtu_event(struct iidc_rdma_vport_dev_info *vdev_info,
 
 	set_bit(event_type, event.type);
 
-	device_lock(&vdev_info->adev->dev);
+	mutex_lock(&vdev_info->iidc_notifier_lock);
 	adev = vdev_info->adev;
-	if (!adev || !adev->dev.driver)
+	if (!adev || !adev->dev.driver || !auxiliary_get_drvdata(adev))
 		goto unlock;
 	iadrv = container_of(adev->dev.driver,
 			     struct iidc_rdma_vport_auxiliary_drv,
@@ -171,7 +174,7 @@ void idpf_idc_vdev_mtu_event(struct iidc_rdma_vport_dev_info *vdev_info,
 	if (iadrv->event_handler)
 		iadrv->event_handler(vdev_info, &event);
 unlock:
-	device_unlock(&vdev_info->adev->dev);
+	mutex_unlock(&vdev_info->iidc_notifier_lock);
 }
 
 /**

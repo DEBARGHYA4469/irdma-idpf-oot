@@ -10,7 +10,7 @@
 #endif
 
 #ifdef OFED_VERSION_CODE
-#if OFED_VERSION_CODE == OFED_VERSION(26, 1)
+#if OFED_VERSION_CODE >= OFED_VERSION(26, 1) && OFED_VERSION_CODE < OFED_VERSION(27, 0)
 #define ALLOC_HW_STATS_V3
 #define ALLOC_HW_STATS_STRUCT_V2
 #define ALLOC_PD_VER_3
@@ -30,6 +30,12 @@
 #define IB_DEALLOC_DRIVER_SUPPORT
 #define IW_PORT_IMMUTABLE_V2
 #define IB_UMEM_GET_V3
+#if OFED_VERSION_CODE >= OFED_VERSION(26, 7)
+#ifndef ib_umem_get
+#define ib_umem_get(dev, addr, size, access) ib_umem_get_va(dev, addr, size, access)
+#endif
+#define RESIZE_USER_CQ
+#endif
 #define IRDMA_ALLOC_MW_VER_2
 #define IRDMA_DESTROY_CQ_VER_4
 #define IRDMA_DESTROY_SRQ_VER_3

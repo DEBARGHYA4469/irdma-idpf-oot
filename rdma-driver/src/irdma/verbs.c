@@ -1879,7 +1879,11 @@ int irdma_process_resize_list(struct irdma_cq *iwcq,
  * @entries: desired cq size
  * @udata: user data
  */
+#ifdef RESIZE_USER_CQ
+static int irdma_resize_cq(struct ib_cq *ibcq, unsigned int entries,
+#else
 static int irdma_resize_cq(struct ib_cq *ibcq, int entries,
+#endif
 			   struct ib_udata *udata)
 {
 #define IRDMA_RESIZE_CQ_MIN_REQ_LEN offsetofend(struct irdma_resize_cq_req, user_cq_buffer)
@@ -4545,7 +4549,11 @@ static const struct ib_device_ops irdma_dev_ops = {
 	.reg_user_mr = irdma_reg_user_mr,
 	.rereg_user_mr = irdma_rereg_user_mr,
 	.req_notify_cq = irdma_req_notify_cq,
+#ifdef RESIZE_USER_CQ
+	.resize_user_cq = irdma_resize_cq,
+#else
 	.resize_cq = irdma_resize_cq,
+#endif
 #ifdef INIT_RDMA_OBJ_SIZE
 	INIT_RDMA_OBJ_SIZE(ib_pd, irdma_pd, ibpd),
 	INIT_RDMA_OBJ_SIZE(ib_ucontext, irdma_ucontext, ibucontext),
@@ -4611,7 +4619,11 @@ static void irdma_set_device_ops(struct ib_device *ibdev)
 	dev_ops->reg_user_mr = irdma_reg_user_mr;
 	dev_ops->rereg_user_mr = irdma_rereg_user_mr;
 	dev_ops->req_notify_cq = irdma_req_notify_cq;
+#ifdef RESIZE_USER_CQ
+	dev_ops->resize_user_cq = irdma_resize_cq;
+#else
 	dev_ops->resize_cq = irdma_resize_cq;
+#endif
 	dev_ops->create_srq = irdma_create_srq;
 	dev_ops->destroy_srq = irdma_destroy_srq;
 	dev_ops->modify_srq = irdma_modify_srq;

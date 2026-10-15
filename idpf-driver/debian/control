@@ -1,7 +1,7 @@
 Source: idpf-dkms
 Section: kernel
 Priority: optional
-Maintainer: Google LLC <support.google.com>
+Maintainer: Google LLC <support@google.com>
 Build-Depends: debhelper-compat (= 13), dkms
 Standards-Version: 4.5.0
 Homepage: http://support.google.com
@@ -13,7 +13,7 @@ Depends: dkms,
          gawk, 
          bash, 
          linux-headers-generic | linux-headers-686-pae | linux-headers-amd64 | linux-headers,
-         unifdef
+         unifdef,
          ${misc:Depends}
 Provides: idpf-dkms
 Description: DKMS build of Infrastructure Data Path Function Linux Driver
