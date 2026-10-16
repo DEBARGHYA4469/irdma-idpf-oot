@@ -72,6 +72,12 @@ ifneq ($(shell grep HAVE_DEVLINK_PORT_NEW $(src)/kcompat_generated_defs.h),)
 export ENABLE_DEVLINK_SUPPORT := 1
 endif # HAVE_DEVLINK_PORT_NEW is in kcompat_generated_defs.h
 
+# The net_dim parameters have changed in 6.13, so check which parameter it's using and
+# set a flag accordingly.
+ifneq ($(shell grep 'void net_dim.*const struct dim_sample \*end_sample' ${KSRC}/include/linux/dim.h),)
+override CFLAGS_EXTRA += -DNET_DIM_V2
+endif
+
 # Construct CONFIG_<DRIVER>=m directives for all the targets. Define a
 # 'to_upper' function to translate targets to uppercase.
 to_upper = $(shell echo '$1' | tr '[:lower:]' '[:upper:]')

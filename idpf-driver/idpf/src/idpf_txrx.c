@@ -5227,7 +5227,11 @@ static void idpf_net_dim(struct idpf_q_vector *q_vector)
 
 	idpf_update_dim_sample(q_vector, &dim_sample, &q_vector->tx_dim,
 			       packets, bytes);
+#ifdef NET_DIM_V2
+	net_dim(&q_vector->tx_dim, &dim_sample);
+#else
 	net_dim(&q_vector->tx_dim, dim_sample);
+#endif
 
 check_rx_itr:
 	if (!IDPF_ITR_IS_DYNAMIC(q_vector->rx_intr_mode))
@@ -5246,7 +5250,11 @@ check_rx_itr:
 
 	idpf_update_dim_sample(q_vector, &dim_sample, &q_vector->rx_dim,
 			       packets, bytes);
+#ifdef NET_DIM_V2
+	net_dim(&q_vector->rx_dim, &dim_sample);
+#else
 	net_dim(&q_vector->rx_dim, dim_sample);
+#endif
 }
 
 /**
