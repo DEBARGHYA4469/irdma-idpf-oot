@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB
-/* Copyright (c) 2015 - 2025 Intel Corporation */
+/* Copyright (c) 2015 - 2023 Intel Corporation */
 #include "osdep.h"
 #include "hmc.h"
 #include "defs.h"
@@ -205,7 +205,7 @@ static void irdma_set_qos_info(struct irdma_sc_vsi  *vsi, struct irdma_l2params 
 				l2p->qs_handle_list[i];
 		if (vsi->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_2)
 			irdma_init_config_check(&vsi->cfg_check[i],
-						l2p->up2tc[i], i,
+						l2p->up2tc[i],
 						l2p->qs_handle_list[i]);
 		vsi->qos[i].traffic_class = l2p->up2tc[i];
 		vsi->qos[i].rel_bw =
@@ -657,7 +657,7 @@ static int irdma_sc_srq_create(struct irdma_sc_srq *srq, u64 scratch,
 		      FIELD_PREP(IRDMA_CQPSQ_SRQ_RQSIZE, srq->hw_srq_size) |
 		      FIELD_PREP(IRDMA_CQPSQ_SRQ_RQ_WQE_SIZE, srq->srq_uk.wqe_size));
 	set_64bit_val(wqe, 8,
-		      FIELD_PREP(IRDMA_AEQE_CMPL_CTXT, srq->srq_uk.srq_id));
+		      srq->srq_uk.srq_id << IRDMA_AEQE_CMPL_CTXT_S);
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMA_CQPSQ_SRQ_PD_ID, srq->pd->pd_id));
 	set_64bit_val(wqe, 32,
@@ -718,7 +718,7 @@ static int irdma_sc_srq_modify(struct irdma_sc_srq *srq,
 		      FIELD_PREP(IRDMA_CQPSQ_SRQ_RQSIZE, srq->hw_srq_size) |
 		      FIELD_PREP(IRDMA_CQPSQ_SRQ_RQ_WQE_SIZE, srq->srq_uk.wqe_size));
 	set_64bit_val(wqe, 8,
-		      FIELD_PREP(IRDMA_AEQE_CMPL_CTXT, srq->srq_uk.srq_id));
+		      srq->srq_uk.srq_id << IRDMA_AEQE_CMPL_CTXT_S);
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMA_CQPSQ_SRQ_PD_ID, srq->pd->pd_id));
 	set_64bit_val(wqe, 32,
@@ -1223,7 +1223,6 @@ static void irdma_sc_qp_setctx_roce_gen_3(struct irdma_sc_qp *qp, __le64 *qp_ctx
 	qw8 = FIELD_PREP(IRDMAQPC_QKEY, roce_info->qkey) |
 	      FIELD_PREP(IRDMAQPC_DESTQP, roce_info->dest_qp);
 	set_64bit_val(qp_ctx, 64, qw8);
-	set_64bit_val(qp_ctx, 72, roce_info->rca_key[0]);
 	set_64bit_val(qp_ctx, 80,
 		      FIELD_PREP(IRDMAQPC_PSNNXT, udp->psn_nxt) |
 		      FIELD_PREP(IRDMAQPC_LSN, udp->lsn));
@@ -1232,7 +1231,6 @@ static void irdma_sc_qp_setctx_roce_gen_3(struct irdma_sc_qp *qp, __le64 *qp_ctx
 	set_64bit_val(qp_ctx, 96,
 		      FIELD_PREP(IRDMAQPC_PSNMAX, udp->psn_max) |
 		      FIELD_PREP(IRDMAQPC_PSNUNA, udp->psn_una));
-	set_64bit_val(qp_ctx, 104, roce_info->rca_key[1]);
 	set_64bit_val(qp_ctx, 112,
 		      FIELD_PREP(IRDMAQPC_CWNDROCE, udp->cwnd));
 	set_64bit_val(qp_ctx, 128,
@@ -1516,6 +1514,7 @@ void irdma_sc_qp_setctx(struct irdma_sc_qp *qp, __le64 *qp_ctx,
 		       FIELD_PREP(IRDMAQPC_LIMIT, tcp->cwnd_inc_limit) |
 		       FIELD_PREP(IRDMAQPC_DROPOOOSEG, tcp->drop_ooo_seg) |
 		       FIELD_PREP(IRDMAQPC_DUPACK_THRESH, tcp->dup_ack_thresh);
+
 		if (iw->ecn_en || iw->dctcp_en) {
 			tcp->tos &= ~ECN_CODE_PT_MASK;
 			tcp->tos |= ECN_CODE_PT_VAL;
@@ -1633,16 +1632,16 @@ static int irdma_sc_alloc_stag(struct irdma_sc_dev *dev,
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMA_CQPSQ_STAG_IDX, info->stag_idx) |
 		      FIELD_PREP(IRDMA_CQPSQ_STAG_PDID_HI, info->pd_id >> 18));
-	if (dev->hw_attrs.uk_attrs.hw_rev < IRDMA_GEN_3) {
-		set_64bit_val(wqe, 40,
-			      FIELD_PREP(IRDMA_CQPSQ_STAG_HMCFNIDX, info->hmc_fcn_index));
-	} else {
-		hdr = 0;
-		hdr |= FIELD_PREP(IRDMA_CQPSQ_STAG_HMCFNIDX, info->hmc_fcn_index);
-		if (dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_4)
-			hdr |= FIELD_PREP(IRDMA_CQPSQ_STAG_NON_CACHED, info->non_cached);
-		set_64bit_val(wqe, 40, hdr);
-	}
+	set_64bit_val(wqe, 40,
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_HMCFNIDX, info->hmc_fcn_index) |
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_NON_CACHED, info->non_cached) |
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_USE_ASO, info->use_aso) |
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_ASO_HOST_ID, info->aso_host_id) |
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_ASO_VM_VF_TYPE, info->aso_vm_vf_type) |
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_ASO_VM_VF_NUM, info->aso_vm_vf_num) |
+		      FIELD_PREP(IRDMA_CQPSQ_STAG_ASO_PF_NUM, info->aso_pf_num));
+	set_64bit_val(wqe, 56,
+		      FIELD_PREP(IRDMA_CQPSQ_PASID, info->pasid));
 
 	if (info->chunk_size)
 		set_64bit_val(wqe, 48,
@@ -1654,15 +1653,12 @@ static int irdma_sc_alloc_stag(struct irdma_sc_dev *dev,
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_LPBLSIZE, info->chunk_size) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_HPAGESIZE, page_size) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_REMACCENABLED, info->remote_access) |
+	      FIELD_PREP(IRDMA_CQPSQ_STAG_USEHMCFNIDX, info->use_hmc_fcn_index) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_PLACEMENTTYPE, info->placement_type) |
+	      FIELD_PREP(IRDMA_CQPSQ_STAG_USEPFRID, info->use_pf_rid) |
+	      FIELD_PREP(IRDMA_CQPSQ_PASID_VALID, info->pasid_valid) |
+	      FIELD_PREP(IRDMA_CQPSQ_STAG_REMOTE_ATOMIC_EN, info->remote_atomics_en) |
 	      FIELD_PREP(IRDMA_CQPSQ_WQEVALID, cqp->polarity);
-	if (dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_3) {
-		hdr |= FIELD_PREP(IRDMA_CQPSQ_STAG_REMOTE_ATOMIC_EN, info->remote_atomics_en);
-		hdr |= FIELD_PREP(IRDMA_CQPSQ_STAG_USEHMCFNIDX, info->use_hmc_fcn_index);
-	} else {
-		/* for FNIC, a PF can send this WQE for a VF */
-		hdr |= FIELD_PREP(IRDMA_CQPSQ_STAG_USEHMCFNIDX, info->use_hmc_fcn_index);
-	}
 	dma_wmb(); /* make sure WQE is written before valid bit is set */
 
 	set_64bit_val(wqe, 24, hdr);
@@ -1753,6 +1749,7 @@ static int irdma_sc_mr_reg_non_shared(struct irdma_sc_dev *dev,
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_VABASEDTO, addr_type) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_USEHMCFNIDX, info->use_hmc_fcn_index) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_PLACEMENTTYPE, info->placement_type) |
+	      FIELD_PREP(IRDMA_CQPSQ_STAG_USEPFRID, info->use_pf_rid) |
 	      FIELD_PREP(IRDMA_CQPSQ_PASID_VALID, info->pasid_valid) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_REMOTE_ATOMIC_EN,
 			 info->remote_atomics_en) |
@@ -1797,6 +1794,7 @@ static int irdma_sc_dealloc_stag(struct irdma_sc_dev *dev,
 
 	hdr = FIELD_PREP(IRDMA_CQPSQ_OPCODE, IRDMA_CQP_OP_DEALLOC_STAG) |
 	      FIELD_PREP(IRDMA_CQPSQ_STAG_MR, info->mr) |
+	      FIELD_PREP(IRDMA_CQPSQ_STAG_SKIPFLUSH, info->skip_flush_markers) |
 	      FIELD_PREP(IRDMA_CQPSQ_WQEVALID, cqp->polarity);
 	dma_wmb(); /* make sure WQE is written before valid bit is set */
 
@@ -1902,6 +1900,7 @@ int irdma_sc_mr_fast_register(struct irdma_sc_qp *qp,
 	set_64bit_val(wqe, 16,
 		      info->total_len |
 		      FIELD_PREP(IRDMAQPSQ_FIRSTPMPBLIDXLO, info->first_pm_pbl_index));
+
 	hdr = FIELD_PREP(IRDMAQPSQ_STAGKEY, info->stag_key) |
 	      FIELD_PREP(IRDMAQPSQ_STAGINDEX, info->stag_idx) |
 	      FIELD_PREP(IRDMAQPSQ_OPCODE, IRDMAQP_OP_FAST_REGISTER) |
@@ -1920,7 +1919,7 @@ int irdma_sc_mr_fast_register(struct irdma_sc_qp *qp,
 	set_64bit_val(wqe, 24, hdr);
 
 	print_hex_dump_debug("WQE: FAST_REG WQE", DUMP_PREFIX_OFFSET, 16, 8,
-			     wqe, quanta * IRDMA_QP_WQE_MIN_SIZE, false);
+			     wqe, IRDMA_QP_WQE_MIN_SIZE, false);
 	if (sq_info.push_wqe)
 		irdma_qp_push_wqe(&qp->qp_uk, wqe, quanta, wqe_idx, post_sq);
 	else if (post_sq)
@@ -3419,7 +3418,15 @@ static int irdma_sc_cq_create(struct irdma_sc_cq *cq, u64 scratch,
 	}
 
 	set_64bit_val(wqe, 0, cq->cq_uk.cq_size);
-	set_64bit_val(wqe, 8, RS_64_1(cq, 1));
+
+	/* GEN_3 HW may emit interrupts for defunct CQs, so a lookup must be
+	 * performed using the CQ ID.
+	 */
+	if (cqp->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3)
+		set_64bit_val(wqe, 8, cq->cq_uk.cq_id);
+	else
+		set_64bit_val(wqe, 8, RS_64_1(cq, 1));
+
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMA_CQPSQ_CQ_SHADOW_READ_THRESHOLD,
 				 cq->shadow_read_threshold));
@@ -3487,7 +3494,15 @@ int irdma_sc_cq_destroy(struct irdma_sc_cq *cq, u64 scratch, bool post_sq)
 		irdma_sc_remove_cq_ctx(ceq, cq);
 
 	set_64bit_val(wqe, 0, cq->cq_uk.cq_size);
-	set_64bit_val(wqe, 8, RS_64_1(cq, 1));
+
+	/* GEN_3 HW may emit interrupts for defunct CQs, so a lookup must be
+	 * performed using the CQ ID.
+	 */
+	if (cqp->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3)
+		set_64bit_val(wqe, 8, cq->cq_uk.cq_id);
+	else
+		set_64bit_val(wqe, 8, RS_64_1(cq, 1));
+
 	set_64bit_val(wqe, 40, cq->shadow_area_pa);
 	set_64bit_val(wqe, 48,
 		      (cq->virtual_map ? cq->first_pm_pbl_idx : 0));
@@ -3561,7 +3576,15 @@ static int irdma_sc_cq_modify(struct irdma_sc_cq *cq,
 		return -ENOMEM;
 
 	set_64bit_val(wqe, 0, info->cq_size);
-	set_64bit_val(wqe, 8, RS_64_1(cq, 1));
+
+	/* GEN_3 HW may emit interrupts for defunct CQs, so a lookup must be
+	 * performed using the CQ ID.
+	 */
+	if (cqp->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3)
+		set_64bit_val(wqe, 8, cq->cq_uk.cq_id);
+	else
+		set_64bit_val(wqe, 8, RS_64_1(cq, 1));
+
 	set_64bit_val(wqe, 16,
 		      FIELD_PREP(IRDMA_CQPSQ_CQ_SHADOW_READ_THRESHOLD, info->shadow_read_threshold));
 	set_64bit_val(wqe, 32, info->cq_pa);
@@ -4043,8 +4066,8 @@ static int irdma_sc_parse_fpm_query_buf(struct irdma_sc_dev *dev, __le64 *buf,
 		ird_encoding = (u8)FIELD_GET(IRDMA_QUERY_FPM_MAX_IRD, temp);
 		hmc_fpm_misc->ird =
 			irdma_sc_get_decoded_ird_size_gen_3(ird_encoding) / 2;
-		dev->hw_attrs.max_hw_ird = hmc_fpm_misc->ird;
-		dev->hw_attrs.max_hw_ord = hmc_fpm_misc->ird;
+		dev->hw_attrs.max_hw_ird = min(hmc_fpm_misc->ird, 255);
+		dev->hw_attrs.max_hw_ord = min(hmc_fpm_misc->ird, 255);
 	}
 	if (dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_1)
 		return 0;
@@ -4309,7 +4332,6 @@ int irdma_sc_cqp_init(struct irdma_sc_cqp *cqp,
 	cqp->protocol_used = info->protocol_used;
 	memcpy(&cqp->dcqcn_params, &info->dcqcn_params, sizeof(cqp->dcqcn_params));
 	cqp->en_rem_endpoint_trk = info->en_rem_endpoint_trk;
-	cqp->timer_slots = info->timer_slots;
 	if (cqp->dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_3) {
 		cqp->ooisc_blksize = info->ooisc_blksize;
 		cqp->rrsp_blksize = info->rrsp_blksize;
@@ -4445,8 +4467,6 @@ int irdma_sc_cqp_create(struct irdma_sc_cqp *cqp, u16 *maj_err, u16 *min_err)
 	temp = FIELD_PREP(IRDMA_CQPHC_ENABLED_VFS, cqp->ena_vf_count) |
 	       FIELD_PREP(IRDMA_CQPHC_HMC_PROFILE, cqp->hmc_profile);
 
-	if (hw_rev == IRDMA_GEN_2)
-		temp |= FIELD_PREP(IRDMA_CQPHC_TMR_SLOT, cqp->timer_slots);
 	if (hw_rev >= IRDMA_GEN_2)
 		temp |= FIELD_PREP(IRDMA_CQPHC_EN_REM_ENDPOINT_TRK,
 				   cqp->en_rem_endpoint_trk);
@@ -4592,9 +4612,6 @@ int irdma_sc_cqp_destroy(struct irdma_sc_cqp *cqp, bool free_hwcqp)
 	dma_free_coherent(cqp->dev->hw->device, cqp->sdbuf.size,
 			  cqp->sdbuf.va, cqp->sdbuf.pa);
 	cqp->sdbuf.va = NULL;
-	irdma_rca_rq_posted = false;
-	if (irdma_rca_ena && cqp->dev->is_pf)
-		irdma_iounmap_db(cqp->dev);
 	return ret_code;
 }
 
@@ -5241,6 +5258,64 @@ int irdma_sc_ceq_destroy(struct irdma_sc_ceq *ceq, u64 scratch, bool post_sq)
 }
 
 /**
+ * irdma_sc_process_ceq_gen_3 - process ceq for gen3 HW
+ * @dev: sc device struct
+ * @ceq: ceq sc structure
+ *
+ * GEN3 HW uses the CQ ID for the CEQE context rather than the direct
+ * pointer. Unlike the normal routine, the caller must ack the CQ.
+ */
+static void *irdma_sc_process_ceq_gen_3(struct irdma_sc_dev *dev,
+					struct irdma_sc_ceq *ceq)
+{
+	u64 temp;
+	__le64 *ceqe;
+	u8 polarity;
+	u32 cq_idx;
+	void *cq = NULL;
+
+	do {
+		ceqe = IRDMA_GET_CURRENT_CEQ_ELEM(ceq);
+		get_64bit_val(ceqe, 0, &temp);
+		polarity = (u8)FIELD_GET(IRDMA_CEQE_VALID, temp);
+		if (polarity != ceq->polarity)
+			return NULL;
+
+		cq_idx = temp;
+
+		/* This is technically susceptible to an A/B/A problem but CQ
+		 * ID allocation is always sequential so there would have to be
+		 * a cycle of 2M CQ create/destroy, and even if the A/B/A is
+		 * hit, it just results in a spurious notification which should
+		 * be harmless.
+		 */
+		if (cq_idx >=
+		    (dev->hmc_info->hmc_obj[IRDMA_HMC_IW_CQ].max_cnt - 1)) {
+			/* Scrubbed CEQEs are set to INVALID, so that's okay. */
+			if (cq_idx != IRDMA_INVALID_CQ_IDX)
+				printk(KERN_ERR
+				       "irdma: Received invalid CQ IDX %u in ISR\n",
+				       cq_idx);
+			cq_idx = IRDMA_INVALID_CQ_IDX;
+		} else {
+			cq = READ_ONCE(dev->cq_table[cq_idx]);
+			if (!cq) {
+				printk(KERN_ERR
+				       "irdma: Skipping stale CEQE for CQ "
+				       "ID %u\n", cq_idx);
+				cq_idx = IRDMA_INVALID_CQ_IDX;
+			}
+		}
+
+		IRDMA_RING_MOVE_TAIL(ceq->ceq_ring);
+		if (!IRDMA_RING_CURRENT_TAIL(ceq->ceq_ring))
+			ceq->polarity ^= 1;
+	} while (cq_idx == IRDMA_INVALID_CQ_IDX);
+
+	return cq;
+}
+
+/**
  * irdma_sc_process_ceq - process ceq
  * @dev: sc device struct
  * @ceq: ceq sc structure
@@ -5257,6 +5332,9 @@ void *irdma_sc_process_ceq(struct irdma_sc_dev *dev, struct irdma_sc_ceq *ceq)
 	u8 polarity;
 	u32 cq_idx;
 	unsigned long flags;
+
+	if (dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3)
+		return irdma_sc_process_ceq_gen_3(dev, ceq);
 
 	do {
 		cq_idx = 0;
@@ -5310,6 +5388,7 @@ void irdma_sc_cleanup_ceqes(struct irdma_sc_cq *cq, struct irdma_sc_ceq *ceq)
 	u64 temp;
 	int next;
 	u32 i;
+	u32 cq_id;
 
 	next = IRDMA_RING_GET_NEXT_TAIL(ceq->ceq_ring, 0);
 
@@ -5321,9 +5400,19 @@ void irdma_sc_cleanup_ceqes(struct irdma_sc_cq *cq, struct irdma_sc_ceq *ceq)
 		if (polarity != ceq_polarity)
 			return;
 
-		next_cq = (struct irdma_sc_cq *)(unsigned long)LS_64_1(temp, 1);
-		if (cq == next_cq)
-			set_64bit_val(ceqe, 0, temp & IRDMA_CEQE_VALID);
+		if (ceq->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3) {
+			/* Intentional truncate. */
+			cq_id = temp;
+			/* Keep the valid bit, but clobber the CQ ID to invalid. */
+			if (cq_id == cq->cq_uk.cq_id)
+				set_64bit_val(ceqe, 0,
+					      (temp & IRDMA_CEQE_VALID) |
+					      IRDMA_INVALID_CQ_IDX);
+		} else {
+			next_cq = (struct irdma_sc_cq *)(unsigned long)LS_64_1(temp, 1);
+			if (cq == next_cq)
+				set_64bit_val(ceqe, 0, temp & IRDMA_CEQE_VALID);
+		}
 
 		next = IRDMA_RING_GET_NEXT_TAIL(ceq->ceq_ring, i);
 		if (!next)
@@ -5544,13 +5633,12 @@ int irdma_sc_get_next_aeqe(struct irdma_sc_aeq *aeq,
 	case IRDMA_AE_LLP_SEGMENT_TOO_SMALL:
 	case IRDMA_AE_LLP_TOO_MANY_RETRIES:
 	case IRDMA_AE_LCE_QP_CATASTROPHIC:
-	case IRDMA_AE_INVALID_RSN_GAP_IN_RSN:
+	case IRDMA_AE_LLP_TOO_MANY_RNRS:
 	case IRDMA_AE_REMOTE_QP_CATASTROPHIC:
 	case IRDMA_AE_LOCAL_QP_CATASTROPHIC:
 	case IRDMA_AE_RCE_QP_CATASTROPHIC:
 	case IRDMA_AE_LLP_DOUBT_REACHABILITY:
 	case IRDMA_AE_LLP_CONNECTION_ESTABLISHED:
-	case IRDMA_AE_LLP_TOO_MANY_RNRS:
 	case IRDMA_AE_RESET_SENT:
 	case IRDMA_AE_TERMINATE_SENT:
 	case IRDMA_AE_RESET_NOT_SENT:
@@ -5770,7 +5858,15 @@ int irdma_sc_ccq_destroy(struct irdma_sc_cq *ccq, u64 scratch, bool post_sq)
 		return -ENOMEM;
 
 	set_64bit_val(wqe, 0, ccq->cq_uk.cq_size);
-	set_64bit_val(wqe, 8, RS_64_1(ccq, 1));
+
+	/* GEN_3 HW may emit interrupts for defunct CQs, so a lookup must be
+	 * performed using the CQ ID.
+	 */
+	if (cqp->dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3)
+		set_64bit_val(wqe, 8, ccq->cq_uk.cq_id);
+	else
+		set_64bit_val(wqe, 8, RS_64_1(ccq, 1));
+
 	set_64bit_val(wqe, 40, ccq->shadow_area_pa);
 
 	if (ccq->dev->hw_wa & NO_CEQMASK)
@@ -6355,8 +6451,6 @@ int irdma_get_rdma_features(struct irdma_sc_dev *dev)
 		feat_type = FIELD_GET(IRDMA_FEATURE_TYPE, temp);
 		dev->feature_info[feat_type] = temp;
 	}
-	if (dev->feature_info[IRDMA_FTN_FLAGS] & IRDMA_ATOMICS_ALLOWED_BIT)
-		dev->hw_attrs.uk_attrs.feature_flags |= IRDMA_FEATURE_ATOMIC_OPS;
 exit:
 	dma_free_coherent(dev->hw->device, feat_buf.size, feat_buf.va,
 			  feat_buf.pa);
@@ -7328,9 +7422,13 @@ int irdma_process_cqp_cmd(struct irdma_sc_dev *dev,
 	spin_lock_irqsave(&dev->cqp_lock, flags);
 	if (list_empty(&dev->cqp_cmd_head) && !irdma_cqp_ring_full(dev->cqp))
 		status = irdma_exec_cqp_cmd(dev, pcmdinfo);
-	else
+	else {
+		dev->cqp_cmds_backlogged++;
+		dev->cqp_backlog_curr++;
+		if (dev->cqp_backlog_curr > dev->cqp_backlog_peak)
+			dev->cqp_backlog_peak = dev->cqp_backlog_curr;
 		list_add_tail(&pcmdinfo->cqp_cmd_entry, &dev->cqp_cmd_head);
-	pcmdinfo->cqp_cmd_exec_status = status;
+	}
 	spin_unlock_irqrestore(&dev->cqp_lock, flags);
 	return status;
 }
@@ -7339,7 +7437,7 @@ int irdma_process_cqp_cmd(struct irdma_sc_dev *dev,
  * irdma_process_bh - called from tasklet for cqp list
  * @dev: sc device struct
  */
-void irdma_process_bh(struct irdma_sc_dev *dev)
+int irdma_process_bh(struct irdma_sc_dev *dev)
 {
 	int status = 0;
 	struct cqp_cmds_info *pcmdinfo;
@@ -7351,9 +7449,10 @@ void irdma_process_bh(struct irdma_sc_dev *dev)
 		pcmdinfo = (struct cqp_cmds_info *)irdma_remove_cqp_head(dev);
 		status = irdma_exec_cqp_cmd(dev, pcmdinfo);
 		if (status)
-			pcmdinfo->cqp_cmd_exec_status = status;
+			break;
 	}
 	spin_unlock_irqrestore(&dev->cqp_lock, flags);
+	return status;
 }
 
 #if IS_ENABLED(CONFIG_CONFIGFS_FS)
@@ -7590,16 +7689,14 @@ int irdma_sc_dev_init(struct irdma_sc_dev *dev, struct irdma_device_init_info *i
 			return -ETIMEDOUT;
 
 		val = readl(dev->hw_regs[IRDMA_GLPCI_LBARCTRL]);
-		if (dev->hw_attrs.uk_attrs.hw_rev <= IRDMA_GEN_2) {
-			db_size = (u8)FIELD_GET(IRDMA_GLPCI_LBARCTRL_PE_DB_SIZE, val);
-			if (db_size != IRDMA_PE_DB_SIZE_4M &&
-			    db_size != IRDMA_PE_DB_SIZE_8M) {
-				ibdev_dbg(to_ibdev(dev),
-					  "DEV: RDMA PE doorbell is not enabled in CSR val 0x%x db_size=%d\n",
-					  val, db_size);
-				return -ENODEV;
+		db_size = (u8)FIELD_GET(IRDMA_GLPCI_LBARCTRL_PE_DB_SIZE, val);
+		if (db_size != IRDMA_PE_DB_SIZE_4M &&
+		    db_size != IRDMA_PE_DB_SIZE_8M) {
+			ibdev_dbg(to_ibdev(dev),
+				  "DEV: RDMA PE doorbell is not enabled in CSR val 0x%x db_size=%d\n",
+				  val, db_size);
+			return -ENODEV;
 			}
-		}
 	} else if (dev->hw_attrs.uk_attrs.hw_rev >= IRDMA_GEN_3) {
 		ret_code = irdma_vchnl_req_get_reg_layout(dev);
 		if (ret_code)
@@ -7696,12 +7793,11 @@ void mev_enable_hw_wa(struct irdma_sc_dev *dev, u64 hw_wa,
 			      CQ_NO_CHECKFLOW;
 		break;
 	case MEV_C0_45:
-		if (dev->hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_4)
-			dev->hw_wa |= REDUCE_ORD_IRD;
+		dev->hw_wa |= REDUCE_ORD_IRD;
 		break;
 	case MMG_DEV_00:
 		dev->hw_wa |= REDUCE_ORD_IRD |
-			      MAX_QP_2K |
+			      FORCE_LPB |
 			      MMG_WA;
 		break;
 	case MEV_B0_37:

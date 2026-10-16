@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #ifndef _IDPF_TXRX_H_
 #define _IDPF_TXRX_H_
@@ -74,6 +74,9 @@
 #define IDPF_MBX_Q_VEC		1
 #define IDPF_MIN_Q_VEC		1
 #define IDPF_MIN_RDMA_VEC	2 /* Minimum vectors to be shared with RDMA */
+#ifdef CONFIG_RCA_SUPPORT
+#define IDPF_MIN_RCA_VEC	1
+#endif /* CONFIG_RCA_SUPPORT */
 
 #define IDPF_DFLT_TX_Q_DESC_COUNT		512
 #define IDPF_DFLT_TX_COMPLQ_DESC_COUNT		512
@@ -170,15 +173,12 @@
 
 #define IDPF_TX_COMPLQ_OVERFLOW_THRESH(txcq)	((txcq)->desc_count >> 1)
 /* Determine the absolute number of completions pending, i.e. the number of
- * completions that are expected to arrive on the TX completion queue.  This
- * number should never be more than ~IDPF_TX_COMPLQ_OVERFLOW_THRESH. That is
- * because once the delta hits IDPF_TX_COMPLQ_OVERFLOW_THRESH, the txq is
- * stopped, i.e. num_compl_pend won't increment. Meanwhile, num_compl should
- * continue incrementing as completions are processed. Eventually the delta
- * will become small enough that the txq can be restarted.
+ * completions that are expected to arrive on the TX completion queue.
  */
 #define IDPF_TX_COMPLQ_PENDING(txq)	\
-	((txq)->tx.num_compl_pend - (txq)->tx.num_compl)
+	(((txq)->tx.num_compl_pend >= (txq)->tx.num_compl ? \
+	0 : U32_MAX) + \
+	(txq)->tx.num_compl_pend - (txq)->tx.num_compl)
 
 #define IDPF_TX_SPLITQ_COMPL_TAG_WIDTH	16
 #define IDPF_TX_SPLITQ_MISS_COMPL_TAG	BIT(15)
@@ -278,7 +278,11 @@ struct idpf_tx_buf {
 	u16 nr_frags:8;
 
 	u16 type:8;
-	u16 compl_tag;
+#define TXBUF_NULL	U16_MAX		/* no next buffer */
+	union {
+		u16 compl_tag;	/* only used with stash */
+		u16 next_buf;	/* index of next entry in list */
+	};
 	DEFINE_DMA_UNMAP_LEN(len);
 	DEFINE_DMA_UNMAP_ADDR(dma);
 };
@@ -627,7 +631,6 @@ struct idpf_intr_reg {
  * struct idpf_q_vector
  * @vport: Vport back pointer
  * @affinity_mask: CPU affinity mask
- * @affinity_notify: IRQ notifier callback
  * @napi: napi handler
  * @v_idx: Vector index
  * @intr_reg: See struct idpf_intr_reg
@@ -652,7 +655,6 @@ struct idpf_intr_reg {
 struct idpf_q_vector {
 	struct idpf_vport *vport;
 	cpumask_t affinity_mask;
-	struct irq_affinity_notify affinity_notify;
 	struct napi_struct napi;
 	u16 v_idx;
 	struct idpf_intr_reg intr_reg;
@@ -768,9 +770,8 @@ struct idpf_sw_queue {
  * @rx.refillqs: Array of refill queues
  * @rx.num_refillq: Number of refill queues associated with the each RX/bufferq
  * @rx.rxq_idx: Index of the RX queue mapped to the buffer queue
- * @cached_phc_time: Pointer to the cached PHC time for Tx/Rx timestamp
- *		     extension
- * @tstmp_en: Indicates whether the Rx timestamping is enabled for the queue
+ * @rx_cached_time: Cached PHC time for the Rx queue
+ * @ptp_rx: Indicates whether the Rx timestamping is enabled for the queue
  * @idx: For buffer queue, it is used as group id, either 0 or 1. On clean,
  *	 buffer queue uses this index to determine which group of refill queues
  *	 to clean.
@@ -870,8 +871,6 @@ struct idpf_queue {
 			struct idpf_tx_buf *bufs;
 			u32 rel_qid;
 			u16 num_txq;
-			u16 last_re;
-			u8 cmpl_tstamp_ns_s;
 		} tx;
 		struct {
 			union {
@@ -893,10 +892,25 @@ struct idpf_queue {
 		} rx;
 	};
 
-	u64 *cached_phc_time;
-	bool tstmp_en;
+	u64 rx_cached_phctime;
+	bool ptp_rx;
+
 	u16 idx;
 	void __iomem *tail;
+	/* New bufs handling. Lists use the index instead of pointers.
+	 * The lock protects softirq_bufs and counter, that counts
+	 * bufs in softirq_bufs and xmit_bufs.
+	 * ndo_xmit grabs from xmit_bufs (moving entries from softirq_bufs
+	 * when empty), and softirq return bufs in softirq_bufs.
+	 */
+	spinlock_t buflist_lock;
+	s32 bufs_available;	/* total free idpf_tx_buf in the two lists. */
+	u16 softirq_bufs;	/* idpf_tx_buf feeed by softirq */
+	u16 xmit_bufs;		/* idpf_tx_buf used in ndo_xmit */
+	u16 buf_pool_size;	/* total number of idpf_tx_buf */
+	bool no_stash;		/* don't use stash for out-of-order completions */
+
+	u16 last_re;		/* index of last RE requested */
 	u16 q_type;
 	u32 q_id;
 	u16 desc_count;
@@ -1026,6 +1040,17 @@ static inline __le64 idpf_tx_singleq_build_ctob(u64 td_cmd, u64 td_offset,
 			   (td_offset << IDPF_TXD_QW1_OFFSET_S) |
 			   ((u64)size << IDPF_TXD_QW1_TX_BUF_SZ_S) |
 			   (td_tag << IDPF_TXD_QW1_L2TAG1_S));
+}
+
+/* Collect the softirq_bufs list into *next_buf. Used in the transmit path. */
+static inline void idpf_grab_softirq_bufs(struct idpf_queue *q, u16 *next_buf)
+{
+	if (*next_buf != TXBUF_NULL)
+		return;
+	spin_lock(&q->buflist_lock);
+	*next_buf = q->softirq_bufs;
+	q->softirq_bufs = TXBUF_NULL;
+	spin_unlock(&q->buflist_lock);
 }
 
 void idpf_tx_splitq_build_ctb(union idpf_tx_flex_desc *desc,

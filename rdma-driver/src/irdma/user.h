@@ -127,7 +127,6 @@
 #define IRDMA_AE_ROE_INVALID_RDMA_READ_REQUEST				0x0313
 #define IRDMA_AE_ROE_INVALID_RDMA_WRITE_OR_READ_RESP			0x0314
 #define IRDMA_AE_ROCE_RSP_LENGTH_ERROR					0x0316
-#define IRDMA_AE_INVALID_RSN_GAP_IN_RSN					0x0317
 #define IRDMA_AE_ROCE_REQ_LENGTH_ERROR					0x0318
 #define IRDMA_AE_ROCE_EMPTY_MCG						0x0380
 #define IRDMA_AE_ROCE_BAD_MC_IP_ADDR					0x0381
@@ -438,6 +437,7 @@ struct irdma_cq_poll_info {
 	bool ud_vlan_valid:1;
 	bool ud_smac_valid:1;
 	bool imm_valid:1;
+	bool ud_error_masked;
 };
 
 struct qp_err_code {
@@ -518,7 +518,6 @@ struct irdma_srq_uk {
 	u8 wqe_size;
 	u8 wqe_size_multiplier;
 	u8 deferred_flag;
-	spinlock_t *lock;
 };
 
 struct irdma_srq_uk_init_info {

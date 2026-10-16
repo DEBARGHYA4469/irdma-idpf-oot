@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #ifndef _VIRTCHNL2_H_
 #define _VIRTCHNL2_H_
@@ -128,7 +128,6 @@ enum virtchnl2_op {
 	VIRTCHNL2_OP_PTP_GET_VPORT_TX_TSTAMP_CAPS	= 548,
 	VIRTCHNL2_OP_GET_LAN_MEMORY_REGIONS		= 549,
 	VIRTCHNL2_OP_GET_OEM_CAPS			= 4999,
-	VIRTCHNL2_OP_OEM_RCA                            = 5000,
 };
 
 #define VIRTCHNL2_RDMA_INVALID_QUEUE_IDX	0xFFFF
@@ -278,7 +277,6 @@ enum virtchnl2_cap_other {
 	VIRTCHNL2_CAP_MISS_COMPL_TAG		= BIT_ULL(20),
 	VIRTCHNL2_CAP_FLOW_STEER		= BIT_ULL(21),
 	VIRTCHNL2_CAP_LAN_MEMORY_REGIONS	= BIT_ULL(22),
-	VIRTCHNL2_CAP_TX_CMPL_TSTMP		= BIT_ULL(23),
 	/* This must be the last capability */
 	VIRTCHNL2_CAP_OEM			= BIT_ULL(63),
 };
@@ -327,7 +325,6 @@ enum virtchnl2_flow_types {
  * selected according to this identification.
  */
 #define VIRTCHNL2_CAP_OEM_P2P			BIT(0)
-#define VIRTCHNL2_CAP_OEM_RCA			BIT(1)
 /* Other OEM specific caps */
 
 /* Underlying device type */
@@ -719,8 +716,6 @@ VIRTCHNL2_CHECK_STRUCT_LEN(8, virtchnl2_version_info);
  *				'num_allocated_vectors'	should be used only
  *				for LAN. Driver can request the max vectors
  *				that is the sum of the two fields, to the OS.
- * @tx_cmpl_tstamp_ns_s: Number of left bit shifts to convert Tx completion
- *			 descriptor timestamp in nanoseconds.
  * @pad1: Padding for future extensions
  *
  * Dataplane driver sends this message to CP to negotiate capabilities and
@@ -771,8 +766,7 @@ struct virtchnl2_get_capabilities {
 	u8 min_sso_packet_len;
 	u8 max_hdr_buf_per_lso;
 	__le16 num_rdma_allocated_vectors;
-	u8 tx_cmpl_tstamp_ns_s;
-	u8 pad1[7];
+	u8 pad1[8];
 };
 VIRTCHNL2_CHECK_STRUCT_LEN(80, virtchnl2_get_capabilities);
 
@@ -1073,7 +1067,6 @@ VIRTCHNL2_CHECK_STRUCT_VAR_LEN(112, virtchnl2_config_rx_queues, qinfo);
  * @num_tx_complq: Number of Tx completion queues
  * @num_rx_q:  Number of Rx queues
  * @num_rx_bufq:  Number of Rx buffer queues
- * @mbx_q_index: Mailbox queue index for allocation
  * @pad: Padding for future extensions
  * @chunks: Chunks of contiguous queues
  *
@@ -1082,9 +1075,6 @@ VIRTCHNL2_CHECK_STRUCT_VAR_LEN(112, virtchnl2_config_rx_queues, qinfo);
  * structure is used to specify the number of each type of queues.
  * CP responds with the same structure with the actual number of queues assigned
  * followed by num_chunks of virtchnl2_queue_chunk structures.
- * ADD_QUEUES is used to add mailbox queues when mbx_q_index is not zero. To add
- * MBX queues, num_tx_q and num_rx_q should be set to 1, and num_tx_complq and
- * num_rx_bufq should be 0.
  *
  * Associated with VIRTCHNL2_OP_ADD_QUEUES.
  */
@@ -1094,8 +1084,7 @@ struct virtchnl2_add_queues {
 	__le16 num_tx_complq;
 	__le16 num_rx_q;
 	__le16 num_rx_bufq;
-	u8 mbx_q_index;
-	u8 pad[3];
+	u8 pad[4];
 	struct virtchnl2_queue_reg_chunks chunks;
 };
 VIRTCHNL2_CHECK_STRUCT_VAR_LEN(56, virtchnl2_add_queues, chunks.chunks);
@@ -2000,8 +1989,8 @@ VIRTCHNL2_CHECK_STRUCT_VAR_LEN(32, virtchnl2_ptp_get_vport_tx_tstamp_caps,
  * @base_incval: The default timer increment value
  * @peer_mbx_q_id: ID of the PTP Device Control daemon queue
  * @peer_id: Peer ID for PTP Device Control daemon
- * @mbx_q_index: Mailbox queue index reserved for PTP out of all MBX queues
- *		 reserved for PF/VF to interact with CP
+ * @secondary_mbx: Indicates to the driver that it should create a secondary
+ *		   mailbox to inetract with control plane for PTP
  * @pad: Padding for future extensions
  * @clk_offsets: Main timer and PHY registers offsets
  * @cross_time_offsets: Cross time registers offsets
@@ -2009,13 +1998,13 @@ VIRTCHNL2_CHECK_STRUCT_VAR_LEN(32, virtchnl2_ptp_get_vport_tx_tstamp_caps,
  *
  * PF/VF sends this message to negotiate PTP capabilities. CP updates bitmap
  * with supported features and fulfills appropriate structures.
- * If CP uses primary MBX for PTP: peer_mbx_q_id holds invalid value (0xFFFF).
- * If CP supports allocation of PF/VF secondary MBXs dedicated
- * for PTP, mbx_q_index will hold a non-zero value. If mbx_q_index is
- * non-zero, driver should allocate secondary MBX queue for PTP. Driver
- * should send ADD_QUEUES command and pass PTP mbx_q_index as mbx_q_index
- * and qtype VIRTCHNL2_QUEUE_TYPE_MBX_TX/RX to inform Control Daemon to
- * allocate new PF/VF MBX queues meant for PTP handling.
+ * If HW uses primary MBX for PTP: secondary_mbx is set to false.
+ * If HW uses secondary MBX for PTP: secondary_mbx is set to true.
+ *	Control plane has 2 MBX and the driver has 1 MBX, send to peer
+ *	driver may be used to send a message using valid ptp_peer_mb_q_id and
+ *	ptp_peer_id.
+ * If HW does not use send to peer driver: secondary_mbx is no care field and
+ * peer_mbx_q_id holds invalid value (0xFFFF).
  *
  * Associated with VIRTCHNL2_OP_PTP_GET_CAPS.
  */
@@ -2025,7 +2014,7 @@ struct virtchnl2_ptp_get_caps {
 	__le64 base_incval;
 	__le16 peer_mbx_q_id;
 	u8 peer_id;
-	u8 mbx_q_index;
+	u8 secondary_mbx;
 	u8 pad[4];
 
 	struct virtchnl2_ptp_clk_reg_offsets clk_offsets;
@@ -2280,8 +2269,6 @@ static inline const char *virtchnl2_op_str(__le32 v_opcode)
 		return "VIRTCHNL2_OP_DEL_QUEUE_GROUPS";
 	case VIRTCHNL2_OP_GET_PORT_STATS:
 		return "VIRTCHNL2_OP_GET_PORT_STATS";
-	case VIRTCHNL2_OP_OEM_RCA:
-		return "VIRTCHNL2_OP_OEM_RCA";
 	case VIRTCHNL2_OP_GET_EDT_CAPS:
 		return "VIRTCHNL2_OP_GET_EDT_CAPS";
 	case VIRTCHNL2_OP_PTP_GET_CAPS:
@@ -2586,7 +2573,6 @@ virtchnl2_vc_validate_vf_msg(struct virtchnl2_version_info *ver, u32 v_opcode,
 		valid_len = sizeof(struct virtchnl2_oem_caps);
 		break;
 	case VIRTCHNL2_OP_RDMA:
-	case VIRTCHNL2_OP_OEM_RCA:
 		/* These messages are opaque to us and will be validated in
 		 * the RDMA client code. We just need to check for nonzero
 		 * length. The firmware will enforce max length restrictions.

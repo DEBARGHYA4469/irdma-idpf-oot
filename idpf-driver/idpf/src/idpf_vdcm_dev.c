@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #include "idpf.h"
 
@@ -1299,9 +1299,9 @@ int idpf_vdcm_dev_open(struct idpf_vdcm *ivdm)
 		if (ret)
 			goto err_config_adi;
 	}
-	ivdm->refcnt++;
 
 	mutex_unlock(&ivdm->ref_lock);
+	ivdm->refcnt++;
 
 	return 0;
 

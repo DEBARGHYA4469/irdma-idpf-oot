@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #ifndef _IDPF_H_
 #define _IDPF_H_
@@ -52,7 +52,7 @@ struct idpf_rss_data;
 #endif /* CONFIG_IOMMU_BYPASS */
 
 #define IDPF_DRV_NAME "idpf"
-#define IDPF_DRV_VER "0.0.653"
+#define IDPF_DRV_VER "0.0.647"
 
 #define IDPF_M(m, s)	((m) << (s))
 
@@ -93,7 +93,6 @@ struct idpf_rss_data;
 
 #define IDPF_VC_XN_IDX_M		GENMASK(7, 0)
 #define IDPF_VC_XN_SALT_M		GENMASK(15, 8)
-#define IDPF_VC_XN_RING_LEN		U8_MAX
 
 #define IDPF_HARD_RESET_TIMEOUT_MSEC	(120 * 1000)
 #define IDPF_CORER_TIMEOUT_MSEC		(120 * 1000)
@@ -123,11 +122,18 @@ struct idpf_mac_filter {
 	bool add;
 };
 
+#ifdef CONFIG_RCA_SUPPORT
+#define IIDC_RDMA_RCA_NAME     "rca"
+
+#endif /* CONFIG_RCA_SUPPORT */
 struct idpf_rdma_data {
 	struct iidc_core_dev_info *cdev_info;
 	struct msix_entry *msix_entries;
 	int aux_idx;
 	u16 num_vecs;
+#ifdef CONFIG_RCA_SUPPORT
+	bool rca_en;
+#endif /* CONFIG_RCA_SUPPORT */
 };
 
 /**
@@ -151,7 +157,6 @@ enum idpf_state {
  * @IDPF_HR_RESET_IN_PROG: Reset in progress
  * @IDPF_REMOVE_IN_PROG: Driver remove in progress
  * @IDPF_MB_INTR_MODE: Mailbox in interrupt mode
- * @IDPF_VC_CORE_INIT: virtchnl core has been init
  * @IDPF_CORER_IN_PROG: CORER is in progress
  * @IDPF_FLAGS_NBITS: Must be last
  */
@@ -161,7 +166,6 @@ enum idpf_flags {
 	IDPF_HR_RESET_IN_PROG,
 	IDPF_REMOVE_IN_PROG,
 	IDPF_MB_INTR_MODE,
-	IDPF_VC_CORE_INIT,
 	IDPF_CORER_IN_PROG,
 	IDPF_FLAGS_NBITS,
 };
@@ -339,7 +343,6 @@ enum idpf_vport_reset_cause {
 /**
  * enum idpf_vport_flags - vport flags
  * @IDPF_VPORT_DEL_QUEUES: To send delete queues message
- * @IDPF_VPORT_MTU_CHANGED: vport's MTU has changed, inform AUX driver
  * @IDPF_VPORT_SW_MARKER: Indicate TX pipe drain software marker packets
  * 			  processing is done
  * @IDPF_VPORT_FLAGS_NBITS: Must be last
@@ -347,7 +350,6 @@ enum idpf_vport_reset_cause {
 enum idpf_vport_flags {
 	IDPF_VPORT_DEL_QUEUES,
 	IDPF_VPORT_SW_MARKER,
-	IDPF_VPORT_MTU_CHANGED,
 	IDPF_VPORT_FLAGS_NBITS,
 };
 
@@ -417,6 +419,9 @@ typedef int (*async_vc_cb) (struct idpf_adapter *, struct idpf_vc_xn *,
 
 /**
  * struct idpf_vc_xn - Data structure representing virtchnl transactions
+ * @vc_op: corresponding opcode sent with this transaction
+ * @idx: index used as retrieval on reply receive, used for cookie
+ * @salt: changed every message to make unique, used for cookie
  * @completed: virtchnl event loop uses that to signal when a reply is
  *	       available, uses kernel completion API
  * @state: virtchnl event loop stores the data below, protected by the
@@ -427,56 +432,54 @@ typedef int (*async_vc_cb) (struct idpf_adapter *, struct idpf_vc_xn *,
  * @reply: Reference to the buffer(s) where the reply data should be written
  *	   to. May be 0-length (then NULL address permitted) if the reply data
  *	   should be ignored.
+ * @free_list: list member field to insert into linked list
  * @async_handler: if sent asynchronously, a callback can be provided to handle
  *		   the reply when it's received
- * @vc_op: corresponding opcode sent with this transaction
- * @idx: index used as retrieval on reply receive, used for cookie
- * @salt: changed every message to make unique, used for cookie
  */
 struct idpf_vc_xn {
+	u32 vc_op;
+	u8 idx;
+	u8 salt;
 	struct completion completed;
 	enum idpf_vc_xn_state state;
 	size_t reply_sz;
 	struct kvec reply;
+	struct list_head free_list;
 	async_vc_cb async_handler;
-	u32 vc_op;
-	u8 idx;
-	u8 salt;
 };
 
 /**
  * struct idpf_vc_xn_params - Parameters for executing transaction
+ * @vc_op: virtchnl op to send
  * @send_buf: kvec for send buffer
  * @recv_buf: kvec for recv buffer, may be NULL, must then have zero length
  * @timeout_ms: timeout to wait for reply
  * @async: send message asynchronously, will not wait on completion
  * @async_handler: if sent asynchronously, optional callback handler
- * @vc_op: virtchnl op to send
  */
 struct idpf_vc_xn_params {
+	u32 vc_op;
 	struct kvec send_buf;
 	struct kvec recv_buf;
 	int timeout_ms;
 	bool async;
 	async_vc_cb async_handler;
-	u32 vc_op;
 };
 
 /**
  * struct idpf_vc_xn_manager - Manager for tracking transactions
- * @ring: backing and lookup for transactions
- * @free_xn_bm: bitmap for free transactions
- * @xn_bm_lock: make bitmap access synchronous where necessary
  * @salt: used to make cookie unique every message
+ * @xn_list_lock: used to protect integrity of list
+ * @free_xns: list of free transactions
+ * @ring: backing and lookup for transactions
  */
 struct idpf_vc_xn_manager {
-	struct idpf_vc_xn ring[IDPF_VC_XN_RING_LEN];
-	DECLARE_BITMAP(free_xn_bm, IDPF_VC_XN_RING_LEN);
-	/* make bitmap access synchronous where necessary */
-	spinlock_t xn_bm_lock;
-	u8 salt;
 	/* has this been initialized */
 	bool active;
+	u8 salt;
+	spinlock_t xn_list_lock;
+	struct list_head free_xns;
+	struct idpf_vc_xn ring[U8_MAX];
 };
 
 /**
@@ -587,9 +590,8 @@ struct idpf_vgrp {
  * @link_up: True if link is up
  * @sw_marker_wq: Workqueue for marker packets
  * @tstamp_config: The Tx tstamp config
- * @tx_tstamp_caps: The capabilities negotiated for Tx timestamping
+ * @tx_tstamps_caps: The capabilities negotiated for Tx timestamping
  * @tstamp_task: Tx timestamping task
- * @finish_reset_task: finish vport's soft reset task
  */
 struct idpf_vport {
 	struct idpf_vgrp dflt_grp;
@@ -635,7 +637,6 @@ struct idpf_vport {
 	struct hwtstamp_config tstamp_config;
 	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps;
 	struct work_struct tstamp_task;
-	struct work_struct finish_reset_task;
 };
 
 /**
@@ -836,6 +837,7 @@ struct idpf_iommu_bypass {
  * @avail_queues: Device given queue limits
  * @vports: Array to store vports created by the driver
  * @netdevs: Associated Vport netdevs
+ * @vport_params_reqd: Vport params requested
  * @vport_params_recvd: Vport params received
  * @vport_ids: Array of device given vport identifiers
  * @vcxn_mngr: Virtchnl transaction manager
@@ -863,7 +865,7 @@ struct idpf_iommu_bypass {
  * @req_rx_splitq: RX split or single queue model to request
  * @crc_enable: Enable CRC insertion offload
  * @init_ctrl_lock: Lock to protect init, re-init, and deinit flow
- * @vport_cfg_lock: Lock to protect access to vports during alloc/dealloc/reset
+ * @vport_ctrl_lock: Lock to protect access to vports during alloc/dealloc/reset
  * @vector_lock: Lock to protect vector distribution
  * @queue_lock: Lock to protect queue distribution
 #ifdef DEVLINK_ENABLED
@@ -874,8 +876,6 @@ struct idpf_iommu_bypass {
  * @sf_cnt: Count of active subfunctions
 #endif
  * @ptp: PTP structure
- * @tx_compl_tstamp_gran_s: Number of left bit shifts to convert Tx completion
- *			    descriptor timestamp in nanoseconds.
  * @corer_done: Used to track the completion of CORER
  */
 struct idpf_adapter {
@@ -912,6 +912,7 @@ struct idpf_adapter {
 	struct idpf_avail_queue_info avail_queues;
 	struct idpf_vport **vports;
 	struct net_device **netdevs;
+	struct virtchnl2_create_vport **vport_params_reqd;
 	struct virtchnl2_create_vport **vport_params_recvd;
 	u32 *vport_ids;
 	struct idpf_vc_xn_manager vcxn_mngr;
@@ -933,12 +934,15 @@ struct idpf_adapter {
 	struct virtchnl2_edt_caps edt_caps;
 	struct idpf_dev_ops dev_ops;
 	struct idpf_rdma_data rdma_data;
+#ifdef CONFIG_RCA_SUPPORT
+	struct idpf_rdma_data rca_data;
+#endif /* CONFIG_RCA_SUPPORT */
 	int num_vfs;
 	bool req_tx_splitq;
 	bool req_rx_splitq;
 	bool crc_enable;
-	struct mutex vport_init_lock;
-	struct mutex vport_cfg_lock;
+	struct mutex init_ctrl_lock;
+	struct mutex vport_ctrl_lock;
 	struct mutex vector_lock;
 	struct mutex queue_lock;
 #ifdef DEVLINK_ENABLED
@@ -949,7 +953,6 @@ struct idpf_adapter {
 	unsigned short sf_cnt;
 #endif /* DEVLINK_ENABLED */
 	struct idpf_ptp ptp;
-	u32 tx_compl_tstamp_gran_s;
 	struct completion corer_done;
 };
 
@@ -1248,54 +1251,53 @@ idpf_txq_from_rel_qid(struct idpf_q_grp *q_grp, struct idpf_queue *complq,
 }
 
 /**
- * idpf_vport_init_lock -Acquire the init/deinit control lock. It
+ * idpf_init_ctrl_lock -Acquire the init/deinit control lock. It
  * controls and protect initialization, re-initialization and
  * deinitialization code flow and its resources.
  * @adapter: private data struct
  *
  * This lock is only used by non-datapath code to protect.
  */
-static inline void idpf_vport_init_lock(struct idpf_adapter *adapter)
+static inline void idpf_init_ctrl_lock(struct idpf_adapter *adapter)
 {
-	mutex_lock(&adapter->vport_init_lock);
+	mutex_lock(&adapter->init_ctrl_lock);
 }
 
 /**
- * idpf_vport_init_unlock - Release the init/deinit control lock
+ * idpf_init_ctrl_unlock - Release the init/deinit control lock
  * @adapter: private data struct
  */
-static inline void idpf_vport_init_unlock(struct idpf_adapter *adapter)
+static inline void idpf_init_ctrl_unlock(struct idpf_adapter *adapter)
 {
-	mutex_unlock(&adapter->vport_init_lock);
+	mutex_unlock(&adapter->init_ctrl_lock);
 }
 
 /**
- * idpf_vport_cfg_lock -Acquire the vport control lock
+ * idpf_vport_ctrl_lock -Acquire the vport control lock
  * @adapter: private data struct
  *
  * This lock should be used by non-datapath code to protect against vport
  * destruction.
  */
-static inline void idpf_vport_cfg_lock(struct idpf_adapter *adapter)
+static inline void idpf_vport_ctrl_lock(struct idpf_adapter *adapter)
 {
-	mutex_lock(&adapter->vport_cfg_lock);
+	mutex_lock(&adapter->vport_ctrl_lock);
 }
 
 /**
- * idpf_vport_cfg_unlock - Release the vport control lock
+ * idpf_vport_ctrl_unlock - Release the vport control lock
  * @adapter: private data struct
  */
-static inline void idpf_vport_cfg_unlock(struct idpf_adapter *adapter)
+static inline void idpf_vport_ctrl_unlock(struct idpf_adapter *adapter)
 {
-	mutex_unlock(&adapter->vport_cfg_lock);
+	mutex_unlock(&adapter->vport_ctrl_lock);
 }
 
 void idpf_statistics_task(struct work_struct *work);
 void idpf_init_task(struct work_struct *work);
 void idpf_service_task(struct work_struct *work);
 void idpf_mbx_task(struct work_struct *work);
-void idpf_ptp_tstamp_task(struct work_struct *work);
-void idpf_finish_soft_reset(struct work_struct *work);
+void idpf_tstamp_task(struct work_struct *work);
 void idpf_vc_event_task(struct work_struct *work);
 void idpf_dev_ops_init(struct idpf_adapter *adapter);
 void idpf_vf_dev_ops_init(struct idpf_adapter *adapter);
@@ -1350,7 +1352,7 @@ int idpf_recv_mb_msg(struct idpf_adapter *adapter);
 int idpf_send_mb_msg(struct idpf_adapter *adapter, u32 op,
 		     u16 msg_size, u8 *msg, u16 cookie);
 ssize_t idpf_vc_xn_exec(struct idpf_adapter *adapter,
-			const struct idpf_vc_xn_params *params);
+			struct idpf_vc_xn_params params);
 void idpf_set_ethtool_ops(struct net_device *netdev);
 void idpf_vport_set_hsplit(struct idpf_vport *vport, bool ena);
 #ifdef DEVLINK_ENABLED
@@ -1376,7 +1378,7 @@ void idpf_netdev_stop_all(struct idpf_adapter *adapter);
 void idpf_device_detach(struct idpf_adapter *adapter);
 int idpf_check_reset_complete(struct idpf_adapter *adapter);
 int idpf_init_hard_reset(struct idpf_adapter *adapter);
-int idpf_reset_recover(struct idpf_adapter *adapter);
+void idpf_reset_recover(struct idpf_adapter *adapter);
 bool idpf_is_reset_detected(struct idpf_adapter *adapter);
 int idpf_vport_queue_ids_init(struct idpf_q_grp *q_grp,
 			      struct virtchnl2_queue_reg_chunks *chunks);
@@ -1421,7 +1423,8 @@ void idpf_idc_deinit_aux_device(struct idpf_adapter *adapter);
 int idpf_idc_vc_receive(struct idpf_rdma_data *rdma_data, u32 f_id, const u8 *msg,
 			u16 msg_size);
 void idpf_idc_event(struct idpf_rdma_data *rdma_data,
-		    enum iidc_event_type event_type);
+		    enum idpf_vport_reset_cause reason,
+		    bool pre_event);
 static inline bool idpf_is_feature_ena(struct idpf_vport *vport,
 				       netdev_features_t feature)
 {

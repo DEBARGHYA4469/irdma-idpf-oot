@@ -1,6 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2019-2025 Intel Corporation
+# Copyright (C) 2019-2024 Intel Corporation
 
 # to be sourced
 
@@ -144,15 +144,13 @@ function find-macro-implementation-decl() {
 	find-decl "$what" "$end" "$@"
 }
 
-# yield first line of $1 typedef definition
-# This only handles typedefs where the name is on first line
+# yield first line of $1 typedef definition (simple typedefs only)
+# this probably won't handle typedef struct { \n int foo;\n};
 function find-typedef-decl() {
 	test $# -ge 2
 	local what end
-	# Assumes type name is followed by other ')', '(', or ';', or
-	# whitespace
-	what="/^typedef$WB.*$1"'[\(\); \t\n]/'
-	end='/;$/'
+	what="/^typedef .* $1"';$/'
+	end=1
 	shift
 	find-decl "$what" "$end" "$@"
 }
@@ -238,7 +236,7 @@ function gen() {
 		shift 3
 
 		if [ -z ${UNIFDEF_MODE:+1} ]; then
-			found_fmt="#define %s 1\n"
+			found_fmt="#define %s\n"
 			missing_fmt=""
 		else
 			found_fmt="-D%s\n"
@@ -342,7 +340,7 @@ function gen() {
 				found_fmt="-D%s\n"
 				missing_fmt="-U%s\n"
 			} else {
-				found_fmt="#define %s 1\n"
+				found_fmt="#define %s\n"
 				missing_fmt=""
 			}
 
@@ -352,17 +350,6 @@ function gen() {
 				printf(missing_fmt, define)
 		}
 	' <<< "$body"
-}
-
-# check() - Like gen, but return true/false instead of generating output
-#
-# syntax:
-#   See gen(), except do not pass a DEFINE name, or the action keyword.
-function check() {
-	# Always run check in unifdef mode
-	local UNIFDEF_MODE=1
-
-	[[ "$(gen CHECK if "$@")" = "-DCHECK" ]]
 }
 
 # tell if given flag is enabled in .config

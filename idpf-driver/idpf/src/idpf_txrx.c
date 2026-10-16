@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #include "kcompat.h"
 #include <linux/timer.h>
@@ -8,6 +8,18 @@
 #endif /* HAVE_GRO_HEADER */
 #include "idpf.h"
 #include "idpf_lan_txrx.h"
+
+static int min_bql_compl = 16;
+module_param(min_bql_compl, int, 0644);
+MODULE_PARM_DESC(min_bql_compl, "Restart netdev when dev is paused and compl is less than threshold");
+
+static bool no_stash = true;
+module_param(no_stash, bool, 0644);
+MODULE_PARM_DESC(no_stash, "Do not use the stash for out of order completions");
+
+static int tx_buf_pool_size = 32767;
+module_param(tx_buf_pool_size, int, 0644);
+MODULE_PARM_DESC(tx_buf_pool_size, "Configurable Tx pool size, min 256 max 64K");
 
 /**
  * idpf_buf_lifo_push - push a buffer pointer onto stack
@@ -132,7 +144,7 @@ static void idpf_tx_buf_rel_all(struct idpf_queue *txq)
 		return;
 
 	/* Free all the Tx buffer sk_buffs */
-	for (i = 0; i < txq->desc_count; i++)
+	for (i = 0; i < txq->buf_pool_size; i++)
 		idpf_tx_buf_rel(txq, &txq->tx.bufs[i]);
 
 	kfree(txq->tx.bufs);
@@ -168,9 +180,6 @@ static void idpf_tx_buf_rel_all(struct idpf_queue *txq)
  */
 static void idpf_tx_desc_rel(struct idpf_queue *txq, bool bufq)
 {
-	if (!txq)
-		return;
-
 	if (bufq) {
 		idpf_tx_buf_rel_all(txq);
 #ifdef HAVE_XDP_SUPPORT
@@ -206,7 +215,7 @@ static void idpf_tx_desc_rel_all(struct idpf_q_grp *q_grp)
 	for (i = 0; i < q_grp->num_txq; i++)
 		idpf_tx_desc_rel(q_grp->txqs[i], true);
 
-	if (!q_grp->complqs)
+	if (!idpf_is_queue_model_split(q_grp->txq_model))
 		return;
 
 	for (i = 0; i < q_grp->num_complq; i++)
@@ -227,10 +236,35 @@ static int idpf_tx_buf_alloc_all(struct idpf_queue *tx_q)
 	/* Allocate book keeping buffers only. Buffers to be supplied to HW
 	 * are allocated by kernel network stack and received as part of skb
 	 */
-	buf_size = sizeof(struct idpf_tx_buf) * tx_q->desc_count;
+	tx_q->buf_pool_size = tx_q->desc_count;
+	tx_q->no_stash = READ_ONCE(no_stash);
+#ifdef HAVE_XDP_SUPPORT
+	if (tx_q->no_stash) {
+		/* no_stash not supported for xdp */
+		if (idpf_xdp_is_prog_ena(tx_q->vport) &&
+		    (tx_q->idx >= tx_q->vport->xdp_txq_offset))
+			tx_q->no_stash = false;
+	}
+#endif
+	if (tx_q->no_stash) {
+		i = READ_ONCE(tx_buf_pool_size);
+		tx_q->buf_pool_size = max_t(u16, 256, min_t(u16, i, 32767));
+	}
+	dev_dbg(tx_q->dev, "queue %d stash %d bufs %d\n",
+		tx_q->idx, tx_q->no_stash, tx_q->buf_pool_size);
+
+	buf_size = sizeof(struct idpf_tx_buf) * tx_q->buf_pool_size;
 	tx_q->tx.bufs = kzalloc(buf_size, GFP_KERNEL);
 	if (!tx_q->tx.bufs)
 		return -ENOMEM;
+
+	spin_lock_init(&tx_q->buflist_lock);
+	tx_q->bufs_available = tx_q->buf_pool_size;
+	tx_q->softirq_bufs = TXBUF_NULL;
+	tx_q->xmit_bufs = 0;
+	for (i = 0; i < tx_q->buf_pool_size - 1; i++)
+		tx_q->tx.bufs[i].next_buf = i + 1;
+	tx_q->tx.bufs[i].next_buf = TXBUF_NULL;
 
 	/* Initialize tx buf stack for out-of-order completions if
 	 * flow scheduling offload is enabled
@@ -449,7 +483,7 @@ static void idpf_rx_buf_rel_all(struct idpf_queue *q)
 #endif /* HAVE_NETDEV_BPF_XSK_POOL */
 			idpf_rx_buf_rel(q, &q->rx.bufs[i]);
 
-	if (q->rx.hdr_buf_va)
+	if (q->rx_hsplit_en)
 		idpf_rx_hdr_buf_rel(q);
 
 	kfree(q->rx.bufs);
@@ -749,33 +783,6 @@ static void idpf_fast_path_txq_deinit(struct idpf_vport *vport)
 }
 
 /**
- * idpf_init_cached_phc_time - Initialize cached PHC time used to extend Tx/Rx
- *			       timestamp value
- * @vport: Vport structure
- * @q_grp: Queue resources
- *
- * Initialize cached PHC time, updated periodically in ptp structure, in Tx and
- * Rx queue to provide a quick and efficient access to these values when the
- * Tx/Rx timestamp are extended to 64 bit.
- */
-static void idpf_init_cached_phc_time(struct idpf_vport *vport,
-				      struct idpf_q_grp *q_grp)
-{
-	struct idpf_adapter *adapter = vport->adapter;
-	struct idpf_ptp *ptp = &adapter->ptp;
-	u16 i;
-
-	if (ptp->get_dev_clk_time_access == IDPF_PTP_NONE)
-		return;
-
-	for (i = 0; i < q_grp->num_rxq; i++)
-		q_grp->rxqs[i]->cached_phc_time = &ptp->cached_phc_time;
-
-	for (i = 0; i < q_grp->num_txq; i++)
-		q_grp->txqs[i]->cached_phc_time = &ptp->cached_phc_time;
-}
-
-/**
  * idpf_rx_buf_alloc_all - Allocate memory for all buffer resources
  * @q_grp: Queue resources
  *
@@ -886,24 +893,7 @@ static void idpf_tx_queue_rel_all(struct idpf_q_grp *q_grp)
 {
 	int i;
 
-	/* If we failed to allcoate txqs, no need to release complqs since they
-	 * won't have been allocated.
-	 */
-	if (!q_grp->txqs)
-		return;
-
 	idpf_tx_desc_rel_all(q_grp);
-
-	for (i = 0; i < q_grp->num_txq; i++) {
-		kfree(q_grp->txqs[i]);
-		q_grp->txqs[i] = NULL;
-	}
-
-	kfree(q_grp->txqs);
-	q_grp->txqs = NULL;
-
-	if (!q_grp->complqs)
-		return;
 
 	for (i = 0; i < q_grp->num_complq; i++) {
 		kfree(q_grp->complqs[i].tx.txqs);
@@ -912,6 +902,14 @@ static void idpf_tx_queue_rel_all(struct idpf_q_grp *q_grp)
 
 	kfree(q_grp->complqs);
 	q_grp->complqs = NULL;
+
+	for (i = 0; i < q_grp->num_txq; i++) {
+		kfree(q_grp->txqs[i]);
+		q_grp->txqs[i] = NULL;
+	}
+
+	kfree(q_grp->txqs);
+	q_grp->txqs = NULL;
 }
 
 /**
@@ -956,9 +954,6 @@ static void idpf_rxq_rel(struct idpf_q_grp *q_grp, struct idpf_queue *rxq,
  */
 static void idpf_bufq_rel(struct idpf_queue *bufq)
 {
-	if (!bufq)
-		return;
-
 	idpf_rx_buf_rel_all(bufq);
 
 	if (!bufq->desc_ring)
@@ -979,15 +974,8 @@ static void idpf_rx_queue_rel_all(struct idpf_q_grp *q_grp)
 	if (!idpf_is_queue_model_split(q_grp->rxq_model))
 		goto rxq_rel;
 
-	if (!q_grp->bufqs)
-		goto rxq_rel;
-
 	for (i = 0; i < q_grp->num_bufq; i++) {
 		idpf_bufq_rel(&q_grp->bufqs[i]);
-
-		if (!q_grp->refillqs)
-			continue;
-
 		kfree(q_grp->refillqs[i].ring);
 	}
 
@@ -997,13 +985,7 @@ static void idpf_rx_queue_rel_all(struct idpf_q_grp *q_grp)
 	q_grp->refillqs = NULL;
 
 rxq_rel:
-	if (!q_grp->rxqs)
-		return;
-
 	for (i = 0; i < q_grp->num_rxq; i++) {
-		if (!q_grp->rxqs[i])
-			continue;
-
 		idpf_rxq_rel(q_grp, q_grp->rxqs[i], q_grp->bufq_per_rxq);
 #ifdef HAVE_XDP_BUFF_RXQ
 		if (xdp_rxq_info_is_reg(&q_grp->rxqs[i]->xdp_rxq))
@@ -1255,7 +1237,6 @@ static int idpf_txq_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_grp)
 		if (!txq)
 			return -ENOMEM;
 
-		u64_stats_init(&txq->stats_sync);
 		q_grp->txqs[i] = txq;
 		txq->vport = vport;
 #ifdef CONFIG_IOMMU_BYPASS
@@ -1271,10 +1252,6 @@ static int idpf_txq_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_grp)
 		txq->tx_max_bufs = idpf_get_max_tx_bufs(adapter);
 		txq->crc_enable = vport->crc_enable;
 		txq->tx_min_pkt_len = idpf_get_min_tx_pkt_len(adapter);
-		if (adapter->tx_compl_tstamp_gran_s) {
-			txq->tx.cmpl_tstamp_ns_s = adapter->tx_compl_tstamp_gran_s;
-			txq->tstmp_en = true;
-		}
 
 		if (flow_sch_en) {
 			set_bit(__IDPF_Q_FLOW_SCH_EN, txq->flags);
@@ -1297,7 +1274,6 @@ static int idpf_txq_alloc(struct idpf_vport *vport, struct idpf_q_grp *q_grp)
 		struct idpf_queue *complq = &q_grp->complqs[i];
 		int j;
 
-		u64_stats_init(&complq->stats_sync);
 #ifdef CONFIG_IOMMU_BYPASS
 #ifdef CONFIG_ARM64
 		if (adapter->iommu_byp.ddev)
@@ -1404,7 +1380,6 @@ static void __idpf_rxq_init(struct idpf_vport *vport, struct idpf_queue *q)
 	struct idpf_vport_user_config_data *config_data;
 	struct idpf_adapter *adapter = vport->adapter;
 
-	u64_stats_init(&q->stats_sync);
 	config_data = &adapter->vport_config[vport->idx]->user_config;
 
 #ifdef CONFIG_IOMMU_BYPASS
@@ -1703,8 +1678,6 @@ int idpf_vport_queue_alloc_all(struct idpf_vport *vport,
 			goto err_out;
 	}
 
-	idpf_init_cached_phc_time(vport, q_grp);
-
 #ifdef HAVE_ETF_SUPPORT
 	config_data = &vport->adapter->vport_config[vport->idx]->user_config;
 	/* Initialize flow scheduling for queues that were requested
@@ -1816,81 +1789,6 @@ static void idpf_tx_splitq_clean_hdr(struct idpf_queue *tx_q,
 	cleaned->packets += tx_buf->gso_segs;
 }
 
-#if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
-/**
- * idpf_tx_hw_tstamp - report hw timestamp from completion desc to stack
- * @txq: pointer to txq struct
- * @skb: original skb
- * @desc_ts: pointer to 3 byte timestamp from descriptor
- */
-static void idpf_tx_hw_tstamp(struct idpf_queue *txq, struct sk_buff *skb,
-			      u8 *desc_ts)
-{
-	struct skb_shared_hwtstamps hwtstamps = { };
-	u64 ext_tstamp;
-	u32 tstamp;
-
-	if (likely(!(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP) ||
-		   !txq->tstmp_en))
-		return;
-
-	tstamp = (desc_ts[0] | (desc_ts[1] << 8) | (desc_ts[2] << 16));
-	tstamp = tstamp << txq->tx.cmpl_tstamp_ns_s;
-
-	ext_tstamp =
-		idpf_ptp_tstamp_extend_32b_to_64b(*txq->cached_phc_time,
-						  tstamp);
-	hwtstamps.hwtstamp = ns_to_ktime(ext_tstamp);
-
-	skb_tstamp_tx(skb, &hwtstamps);
-}
-#else
-static inline void idpf_tx_hw_tstamp(struct idpf_queue *txq,
-				     struct sk_buff *skb, u8 *desc_ts) { }
-#endif /* CONFIG_PTP_1588_CLOCK */
-
-/**
- * idpf_tx_read_tstamp - schedule a work to read Tx timestamp value
- * @txq: queue to read the timestamp from
- * @skb: socket buffer to provide Tx timestamp value
- *
- * Schedule a work to read Tx timestamp value generated once the packet is
- * transmitted.
- */
-static void idpf_tx_read_tstamp(struct idpf_queue *txq, struct sk_buff *skb)
-{
-	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps;
-	struct idpf_ptp_tx_tstamp_status *tx_tstamp_status;
-	enum idpf_ptp_access access;
-	int i;
-
-	if (!txq->vport->tx_tstamp_caps)
-		return;
-
-	access = txq->vport->adapter->ptp.tx_tstamp_access;
-	tx_tstamp_caps = txq->vport->tx_tstamp_caps;
-
-	for (i = 0; i < tx_tstamp_caps->num_entries; i++) {
-		tx_tstamp_status = &tx_tstamp_caps->tx_tstamp_status[i];
-		if (tx_tstamp_status->state == IDPF_PTP_FREE) {
-			tx_tstamp_status->skb = skb;
-			tx_tstamp_status->state = IDPF_PTP_REQUEST;
-
-			if (access == IDPF_PTP_MAILBOX) {
-				/* Fetch timestamp from completion descriptor through
-				 * virtchnl msg to report to stack.
-				 */
-				queue_work(system_unbound_wq,
-					   &txq->vport->tstamp_task);
-			} else if (access == IDPF_PTP_DIRECT) {
-				idpf_ptp_get_tx_tstamp(txq->vport);
-			}
-
-			break;
-		}
-	}
-}
-
 /**
  * idpf_tx_clean_stashed_bufs - clean bufs that were stored for
  * out of order completions
@@ -1904,8 +1802,11 @@ static void
 idpf_tx_clean_stashed_bufs(struct idpf_queue *txq, u16 compl_tag, u8 *desc_ts,
 			   struct idpf_cleaned_stats *cleaned, int budget)
 {
+	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps = txq->vport->tx_tstamp_caps;
+	struct idpf_ptp_tx_tstamp_status *tx_tstamp_status;
 	struct idpf_tx_stash *stash;
 	struct hlist_node *tmp_buf;
+	u16 i;
 
 	/* Buffer completion */
 	hash_for_each_possible_safe(txq->sched_buf_hash, stash, tmp_buf,
@@ -1920,7 +1821,21 @@ idpf_tx_clean_stashed_bufs(struct idpf_queue *txq, u16 compl_tag, u8 *desc_ts,
 			if (!(skb_shinfo(stash->buf.skb)->tx_flags & SKBTX_IN_PROGRESS))
 				goto skip_tx_tstamp;
 
-			idpf_tx_read_tstamp(txq, stash->buf.skb);
+			for (i = 0; i < tx_tstamp_caps->num_entries; i++) {
+				tx_tstamp_status = &tx_tstamp_caps->tx_tstamp_status[i];
+				if (tx_tstamp_status->state == IDPF_PTP_FREE) {
+					tx_tstamp_status->skb = stash->buf.skb;
+					tx_tstamp_status->state = IDPF_PTP_REQUEST;
+
+					/* Fetch timestamp from completion
+					 * descriptor through virtchnl msg to
+					 * report to stack.
+					 */
+					queue_work(system_unbound_wq,
+						   &txq->vport->tstamp_task);
+					break;
+				}
+			}
 skip_tx_tstamp:
 			idpf_tx_splitq_clean_hdr(txq, &stash->buf, cleaned,
 						 budget);
@@ -1928,11 +1843,6 @@ skip_tx_tstamp:
 		case IDPF_TX_BUF_SKB:
 			if (unlikely(stash->miss_pkt))
 				del_timer(&stash->reinject_timer);
-
-			/* Fetch timestamp from completion descriptor to report
-			 * to stack.
-			 */
-			idpf_tx_hw_tstamp(txq, stash->buf.skb, desc_ts);
 
 #ifdef HAVE_XDP_SUPPORT
 			fallthrough;
@@ -2116,6 +2026,11 @@ idpf_tx_splitq_clean(struct idpf_queue *tx_q, u16 end, int napi_budget,
 	struct idpf_tx_buf *tx_buf;
 	bool clean_complete = true;
 
+	if (tx_q->no_stash) {
+		tx_q->next_to_clean = end;
+		return true;
+	}
+
 	tx_desc = IDPF_FLEX_TX_DESC(tx_q, ntc);
 	next_pending_desc = IDPF_FLEX_TX_DESC(tx_q, end);
 	tx_buf = &tx_q->tx.bufs[ntc];
@@ -2189,6 +2104,13 @@ do {							\
 	}						\
 } while (0)
 
+static void idpf_maybe_dma_unmap_page(struct idpf_queue *tx_q,
+				      struct idpf_tx_buf *tx_buf)
+{
+	dma_unmap_page(tx_q->dev, dma_unmap_addr(tx_buf, dma),
+		       dma_unmap_len(tx_buf, len), DMA_TO_DEVICE);
+}
+
 /**
  * idpf_tx_clean_buf_ring - clean flow scheduling TX queue buffers
  * @txq: queue to clean
@@ -2207,13 +2129,16 @@ static bool idpf_tx_clean_buf_ring(struct idpf_queue *txq, u16 compl_tag,
 				   struct idpf_cleaned_stats *cleaned,
 				   u8 *desc_ts, int budget)
 {
+	struct idpf_ptp_vport_tx_tstamp_caps *tx_tstamp_caps = txq->vport->tx_tstamp_caps;
+	struct idpf_ptp_tx_tstamp_status *tx_tstamp_status;
 	u16 idx = compl_tag & txq->compl_tag_bufid_m;
 	u16 ntc, eop_idx, orig_idx = idx;
 	struct idpf_tx_buf *tx_buf;
+	u16 i;
 
-	tx_buf = &txq->tx.bufs[idx];
+	tx_buf = txq->no_stash ? &txq->tx.bufs[compl_tag] : &txq->tx.bufs[idx];
 
-	if (unlikely(tx_buf->compl_tag != compl_tag))
+	if (unlikely(!txq->no_stash && tx_buf->compl_tag != compl_tag))
 		return false;
 
 	switch (tx_buf->type) {
@@ -2221,17 +2146,25 @@ static bool idpf_tx_clean_buf_ring(struct idpf_queue *txq, u16 compl_tag,
 		if (!(skb_shinfo(tx_buf->skb)->tx_flags & SKBTX_IN_PROGRESS))
 			goto skip_tx_tstamp;
 
-		idpf_tx_read_tstamp(txq, tx_buf->skb);
+		for (i = 0; i < tx_tstamp_caps->num_entries; i++) {
+			tx_tstamp_status = &tx_tstamp_caps->tx_tstamp_status[i];
+			if (tx_tstamp_status->state == IDPF_PTP_FREE) {
+				tx_tstamp_status->skb = tx_buf->skb;
+				tx_tstamp_status->state = IDPF_PTP_REQUEST;
+
+				/* Fetch timestamp from completion descriptor
+				 * through virtchnl msg to report to stack.
+				 */
+				queue_work(system_unbound_wq,
+					   &txq->vport->tstamp_task);
+				break;
+			}
+		}
 skip_tx_tstamp:
 		eop_idx = tx_buf->eop_idx;
 		idpf_tx_splitq_clean_hdr(txq, tx_buf, cleaned, budget);
 		break;
 	case IDPF_TX_BUF_SKB:
-		/* fetch timestamp from completion
-		 * descriptor to report to stack
-		 */
-		idpf_tx_hw_tstamp(txq, tx_buf->skb, desc_ts);
-
 #ifdef HAVE_XDP_SUPPORT
 		fallthrough;
 	case IDPF_TX_BUF_XDP:
@@ -2241,6 +2174,30 @@ skip_tx_tstamp:
 		break;
 	default:
 		return false;
+	}
+
+	if (txq->no_stash) {
+		u16 freed_buf = 1;
+		/* First buffer was already cleaned up, process others. */
+		while (tx_buf->next_buf != TXBUF_NULL) {
+			freed_buf++;
+			tx_buf = &txq->tx.bufs[tx_buf->next_buf];
+			if (tx_buf->type == IDPF_TX_BUF_FRAG) {
+				if (dma_unmap_len(tx_buf, len))
+					idpf_maybe_dma_unmap_page(txq, tx_buf);
+				dma_unmap_len_set(tx_buf, len, 0);
+			}
+			tx_buf->type = IDPF_TX_BUF_EMPTY;
+		}
+
+		/* Prepend compl_tag to the softirq freelist */
+		spin_lock(&txq->buflist_lock);
+		tx_buf->next_buf = txq->softirq_bufs;
+		txq->softirq_bufs = compl_tag;
+		txq->bufs_available += freed_buf;
+		BUG_ON(txq->bufs_available > txq->buf_pool_size);
+		spin_unlock(&txq->buflist_lock);
+		return true; /* No bump next_to_clean */
 	}
 
 	while (idx != eop_idx) {
@@ -2414,9 +2371,9 @@ idpf_tx_handle_rs_completion(struct idpf_queue *txq,
 	if (unlikely(test_bit(__IDPF_Q_MISS_TAG_EN, txq->flags) &&
 		     compl_tag & IDPF_TX_SPLITQ_MISS_COMPL_TAG)) {
 		compl_tag &= ~IDPF_TX_SPLITQ_MISS_COMPL_TAG;
-
-		return idpf_tx_handle_miss_completion(txq, desc, cleaned,
-						      compl_tag, budget);
+		if (!txq->no_stash)
+			return idpf_tx_handle_miss_completion(txq, desc, cleaned,
+							      compl_tag, budget);
 	}
 #ifdef HAVE_XDP_SUPPORT
 #ifdef HAVE_NETDEV_BPF_XSK_POOL
@@ -2505,6 +2462,35 @@ idpf_tx_handle_reinject_completion(struct idpf_queue *txq,
 	 */
 }
 
+/* We cannot block if there are too few pending completions,
+ * or the queue could stall forever.
+ *
+ * netdev_tx_completed()
+ * should look like this but TOO_FEW_PENDING_COMPL() is missing.
+ * We can remedy adding the missing check and action at the end.
+ *
+ * dql_completed(bytes); smp_mb();
+ * if (! (bql_avail() >= 0 || TOO_FEW_PENDING_COMPL())) ) return;
+ * if (test_and_clear(STACK_XOFF)) netif_schedule_queue()
+ *
+ * netdev_tx_sent_queue() should look like this but
+ * TOO_FEW_PENDING_COMPL() is missing. The first one is only causing
+ * unnecessary settings of STACK_XOFF, we can remedy adding the
+ * missing check at the end.
+ *
+ * dql_queued(bytes);
+ * if (bql_avail() >= 0 || TOO_FEW_PENDING_COMPL()) return;
+ * write_jiffies(); smp_mb_before_atomic();
+ * set_bit(STACK_XOFF); smp_mb()
+ * if (bql_avail() >= 0 || TOO_FEW_PENDING_COMPL()) clear_bit(STACK_XOFF)
+ */
+static bool idpf_complq_maybe_restart(struct idpf_queue *complq, struct netdev_queue *nq) {
+	if (IDPF_TX_COMPLQ_PENDING(complq) < READ_ONCE(min_bql_compl) &&
+	    test_and_clear_bit(__QUEUE_STATE_STACK_XOFF, &nq->state))
+		return true;
+	return false;
+}
+
 /**
  * idpf_tx_clean_complq - Reclaim resources on completion queue
  * @complq: Tx ring to clean
@@ -2571,6 +2557,7 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 					     IDPF_TXD_COMPLT_RE);
 			break;
 		case IDPF_TXD_COMPLT_RS:
+handle_rs_completion:
 			idpf_tx_handle_rs_completion(tx_q, tx_desc,
 						     &cleaned_stats, budget);
 			break;
@@ -2578,6 +2565,9 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 			idpf_tx_handle_sw_marker(tx_q);
 			break;
 		case IDPF_TXD_COMPLT_RULE_MISS:
+			if (tx_q->no_stash)
+				goto handle_rs_completion;
+
 			compl_tag =
 				le16_to_cpu(tx_desc->q_head_compl_tag.compl_tag);
 
@@ -2586,6 +2576,9 @@ static bool idpf_tx_clean_complq(struct idpf_queue *complq, int budget,
 						       compl_tag, budget);
 			break;
 		case IDPF_TXD_COMPLT_REINJECTED:
+			if (tx_q->no_stash)
+				goto fetch_next_desc;
+
 			idpf_tx_handle_reinject_completion(tx_q, tx_desc,
 							   &cleaned_stats,
 							   budget);
@@ -2664,6 +2657,8 @@ fetch_next_desc:
 		/* Update BQL */
 		nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
 		netdev_tx_completed_queue(nq, tx_q->cleaned_pkts, tx_q->cleaned_bytes);
+		if (idpf_complq_maybe_restart(complq, nq))
+			netif_schedule_queue(nq);
 
 		/* Reset cleaned stats for the next time this queue is cleaned */
 		tx_q->cleaned_bytes = 0;
@@ -2672,7 +2667,7 @@ fetch_next_desc:
 		/* Check if the TXQ needs to and can be restarted */
 		if (unlikely(netif_tx_queue_stopped(nq) && complq_ok &&
 			     netif_carrier_ok(tx_q->vport->netdev) &&
-			     !IDPF_TX_BUF_RSV_LOW(tx_q) &&
+			     (tx_q->no_stash || !IDPF_TX_BUF_RSV_LOW(tx_q)) &&
 			     (IDPF_DESC_UNUSED(tx_q) >= IDPF_TX_WAKE_THRESH))) {
 			/* Make sure any other threads stopping queue after
 			 * this see new next_to_clean.
@@ -2737,53 +2732,76 @@ void idpf_tx_splitq_build_flow_desc(union idpf_tx_flex_desc *desc,
 	desc->flow.qw1.ts[2] = params->offload.desc_ts[2];
 }
 
-/**
- * idpf_tx_splitq_has_room - check if enough Tx splitq resources are available
- * @txq: the queue to be checked
- * @desc_count: number of descriptors required for this packet
- *
- * Returns -EBUSY if a stop is needed, else 0
+/* Global conditions to tell whether the txq (and related resources)
+ * has room to allow the use of "size" descriptors.
  */
-static bool idpf_tx_splitq_has_room(struct idpf_queue *txq,
-				    unsigned int desc_count)
+static bool txq_has_room(struct idpf_queue *tx_q, unsigned int size)
 {
-	if (IDPF_DESC_UNUSED(txq) < desc_count ||
-	    IDPF_TX_COMPLQ_PENDING(txq->tx.complq) >
-	    IDPF_TX_COMPLQ_OVERFLOW_THRESH(txq->tx.complq) ||
-	    IDPF_TX_BUF_RSV_LOW(txq))
+	if (IDPF_DESC_UNUSED(tx_q) < size ||
+	    tx_q->bufs_available < size ||
+	    IDPF_TX_COMPLQ_PENDING(tx_q->tx.complq) >
+		IDPF_TX_COMPLQ_OVERFLOW_THRESH(tx_q->tx.complq) ||
+	    (!tx_q->no_stash && IDPF_TX_BUF_RSV_LOW(tx_q)))
 		return false;
-
 	return true;
 }
 
 /**
- * idpf_tx_maybe_stop_splitq - check for Tx splitq stop conditions
- * @txq: the queue to be checked
- * @desc_count: number of descriptors required for this packet
+ * __idpf_tx_maybe_stop_common - 2nd level check for common Tx stop conditions
+ * @tx_q: the queue to be checked
+ * @size: the size buffer we want to assure is available
  *
- * Returns 0 if stop is not needed
+ * Returns -EBUSY if a stop is needed, else 0
  */
-static int idpf_tx_maybe_stop_splitq(struct idpf_queue *txq,
-				     unsigned int desc_count)
+static int __idpf_tx_maybe_stop_common(struct idpf_queue *tx_q,
+				       unsigned int size)
 {
-	if (likely(idpf_tx_splitq_has_room(txq, desc_count)))
-		return 0;
-
-	u64_stats_update_begin(&txq->stats_sync);
-	u64_stats_inc(&txq->q_stats.tx.q_busy);
-	u64_stats_update_end(&txq->stats_sync);
-
-	netif_stop_subqueue(txq->vport->netdev, txq->idx);
+	netif_stop_subqueue(tx_q->vport->netdev, tx_q->idx);
 
 	/* Memory barrier before checking head and tail */
 	smp_mb();
 
 	/* Check again in a case another CPU has just made room available. */
-	if (likely(!idpf_tx_splitq_has_room(txq, desc_count)))
+	if (likely(!txq_has_room(tx_q, size)))
 		return -EBUSY;
 
 	/* A reprieve! - use start_subqueue because it doesn't call schedule */
-	netif_start_subqueue(txq->vport->netdev, txq->idx);
+	netif_start_subqueue(tx_q->vport->netdev, tx_q->idx);
+
+	return 0;
+}
+
+/**
+ * idpf_tx_maybe_stop_common - 1st level check for common Tx stop conditions
+ * @tx_q: the queue to be checked
+ * @size: number of descriptors we want to assure is available
+ *
+ * Returns 0 if stop is not needed
+ */
+int idpf_tx_maybe_stop_common(struct idpf_queue *tx_q, unsigned int size)
+{
+	if (likely(txq_has_room(tx_q, size)))
+		return 0;
+
+	u64_stats_update_begin(&tx_q->stats_sync);
+	u64_stats_inc(&tx_q->q_stats.tx.q_busy);
+	u64_stats_update_end(&tx_q->stats_sync);
+
+	return __idpf_tx_maybe_stop_common(tx_q, size);
+}
+
+/**
+ * idpf_tx_maybe_stop_splitq - 1st level check for Tx splitq stop conditions
+ * @tx_q: the queue to be checked
+ * @descs_needed: number of descriptors required for this packet
+ *
+ * Returns 0 if stop is not needed
+ */
+static int idpf_tx_maybe_stop_splitq(struct idpf_queue *tx_q,
+				     unsigned int descs_needed)
+{
+	if (idpf_tx_maybe_stop_common(tx_q, descs_needed))
+		return -EBUSY;
 
 	return 0;
 }
@@ -2805,6 +2823,8 @@ void idpf_tx_buf_hw_update(struct idpf_queue *tx_q, u32 val,
 
 	nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
 	tx_q->next_to_use = val;
+
+	idpf_tx_maybe_stop_common(tx_q, IDPF_TX_DESC_NEEDED);
 
 	/* Force memory writes to complete before letting h/w
 	 * know there are new descriptors to fetch.  (Only
@@ -3065,6 +3085,8 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 	skb_frag_t *frag;
 	u16 td_cmd = 0;
 	dma_addr_t dma;
+	int buf_used = 0;
+	struct idpf_tx_buf *new_tx_buf = first;		/* used in no_stash */
 
 	skb = first->skb;
 
@@ -3079,17 +3101,28 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 
 	tx_buf = first;
 
+	if (tx_q->no_stash) {
+		params->compl_tag = first - tx_q->tx.bufs;
+		goto scan_skb;
+	}
+
 	params->compl_tag =
 		(tx_q->compl_tag_cur_gen << tx_q->compl_tag_gen_s) | i;
 
+scan_skb:
 	for (frag = &skb_shinfo(skb)->frags[0];; frag++) {
 		unsigned int max_data = IDPF_TX_MAX_DESC_DATA_ALIGNED;
 
 		if (dma_mapping_error(tx_q->dev, dma))
 			return idpf_tx_dma_map_error(tx_q, skb, first, i);
 
+		if (tx_q->no_stash) {	/* recover the correct value */
+			tx_buf = new_tx_buf;
+			buf_used++;
+		}
 		first->nr_frags++;
-		tx_buf->compl_tag = params->compl_tag;
+		if (!tx_q->no_stash)
+			tx_buf->compl_tag = params->compl_tag;
 		tx_buf->type = IDPF_TX_BUF_FRAG;
 
 		/* record length, and DMA address */
@@ -3165,7 +3198,8 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 			 * simply pass over these holes and finish cleaning the
 			 * rest of the packet.
 			 */
-			tx_buf->type = IDPF_TX_BUF_EMPTY;
+			if (!tx_q->no_stash)	/* not used in new mode */
+				tx_buf->type = IDPF_TX_BUF_EMPTY;
 
 			/* Adjust the DMA offset and the remaining size of the
 			 * fragment.  On the first iteration of this loop,
@@ -3200,6 +3234,11 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 			tx_desc++;
 		}
 
+		if (tx_q->no_stash) {	/* prepare for next round */
+			idpf_grab_softirq_bufs(tx_q, &new_tx_buf->next_buf);
+			new_tx_buf = &tx_q->tx.bufs[new_tx_buf->next_buf];
+		}
+
 		size = skb_frag_size(frag);
 		data_len -= size;
 
@@ -3220,6 +3259,16 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 	idpf_tx_splitq_build_desc(tx_desc, params, td_cmd, size);
 	i = idpf_tx_splitq_bump_ntu(tx_q, i);
 
+	if (tx_q->no_stash) {
+		/* Return unused buffers to the txq_freelist */
+		tx_q->xmit_bufs = new_tx_buf->next_buf;
+		new_tx_buf->next_buf = TXBUF_NULL;
+		spin_lock(&tx_q->buflist_lock);
+		tx_q->bufs_available -= buf_used;
+		BUG_ON(tx_q->bufs_available < 0);
+		spin_unlock(&tx_q->buflist_lock);
+	}
+
 	/* Update complq on how many completions to expect. */
 	complq = tx_q->tx.complq;
 	complq->tx.num_compl_pend++;
@@ -3227,6 +3276,7 @@ static void idpf_tx_splitq_map(struct idpf_queue *tx_q,
 	/* record bytecount for BQL */
 	nq = netdev_get_tx_queue(tx_q->vport->netdev, tx_q->idx);
 	netdev_tx_sent_queue(nq, first->bytecount);
+	idpf_complq_maybe_restart(tx_q->tx.complq, nq);
 
 	idpf_tx_buf_hw_update(tx_q, i, netdev_xmit_more());
 }
@@ -3435,7 +3485,8 @@ idpf_tx_splitq_get_ctx_desc(struct idpf_queue *txq)
 	union idpf_flex_tx_ctx_desc *desc;
 	int i = txq->next_to_use;
 
-	txq->tx.bufs[i].type = IDPF_TX_BUF_RSVD;
+	if (!txq->no_stash)
+		txq->tx.bufs[i].type = IDPF_TX_BUF_RSVD;
 
 	/* grab the next descriptor */
 	desc = IDPF_FLEX_TX_CTX_DESC(txq, i);
@@ -3483,11 +3534,11 @@ static bool idpf_tx_tstamp(struct idpf_queue *tx_q, u8 *index,
 		return false;
 
 	access = tx_q->vport->adapter->ptp.tx_tstamp_access;
-	if (access == IDPF_PTP_NONE)
+	if (access != IDPF_PTP_MAILBOX)
 		return false;
 
 	/* Grab an open timestamp slot */
-	idx = idpf_ptp_request_tstamp_idx(tx_q->vport, skb);
+	idx = idpf_ptp_request_ts(tx_q->vport, skb);
 	if (idx < 0)
 		return false;
 
@@ -3499,13 +3550,11 @@ static bool idpf_tx_tstamp(struct idpf_queue *tx_q, u8 *index,
 
 /**
  * idpf_tx_splitq_need_re - check whether RE bit needs to be set
- * @tx_q: the tx ring to verify
- *
- * Return: true if RE bit needs to be set, false otherwise
+ * @txq: the tx ring to verify
  */
 static inline bool idpf_tx_splitq_need_re(struct idpf_queue *tx_q)
 {
-	int gap = tx_q->next_to_use - tx_q->tx.last_re;
+	int gap = tx_q->next_to_use - tx_q->last_re;
 
 	gap += (gap < 0) ? tx_q->desc_count : 0;
 
@@ -3584,6 +3633,11 @@ static netdev_tx_t idpf_tx_splitq_frame(struct sk_buff *skb,
 	}
 	/* record the location of the first descriptor for this packet */
 	first = &tx_q->tx.bufs[tx_q->next_to_use];
+	if (tx_q->no_stash) {
+		/* Grab entries from the softirq_bufs, we know there are enough */
+		idpf_grab_softirq_bufs(tx_q, &tx_q->xmit_bufs);
+		first = &tx_q->tx.bufs[tx_q->xmit_bufs];
+	}
 	first->skb = skb;
 
 	if (tso) {
@@ -3614,7 +3668,7 @@ static netdev_tx_t idpf_tx_splitq_frame(struct sk_buff *skb,
 			struct idpf_queue *complq = tx_q->tx.complq;
 
 			tx_params.eop_cmd |= IDPF_TXD_FLEX_FLOW_CMD_RE;
-			tx_q->tx.last_re = tx_q->next_to_use;
+			tx_q->last_re = tx_q->next_to_use;
 			complq->tx.num_compl_pend++;
 		}
 
@@ -3979,7 +4033,7 @@ static void idpf_rx_hwtstamp(struct idpf_queue *rxq,
 	u64 cached_time, ts_ns;
 	u32 ts_high;
 
-	cached_time = READ_ONCE(*rxq->cached_phc_time);
+	cached_time = READ_ONCE(rxq->rx_cached_phctime);
 
 	if (rx_desc->ts_low & VIRTCHNL2_RX_FLEX_TSTAMP_VALID) {
 		ts_high = le32_to_cpu(rx_desc->ts_high);
@@ -4023,7 +4077,7 @@ int idpf_rx_process_skb_fields(struct idpf_queue *rxq,
 
 	/* process RSS/hash */
 	idpf_rx_hash(rxq, skb, rx_desc, &decoded);
-	if (!rxq->tstmp_en)
+	if (!rxq->ptp_rx)
 		goto skip_tstamp;
 
 	idpf_rx_hwtstamp(rxq, rx_desc, skb);
@@ -4679,11 +4733,6 @@ static int idpf_rx_splitq_clean(struct idpf_queue *rxq, int budget)
 		gen_id = le16_to_cpu(rx_desc->pktlen_gen_bufq_id);
 		gen_id = FIELD_GET(VIRTCHNL2_RX_FLEX_DESC_ADV_GEN_M, gen_id);
 
-		/* This memory barrier is needed to keep us from reading
-		 * any other fields out of the rx_desc
-		 */
-		dma_rmb();
-
 		if (test_bit(__IDPF_Q_GEN_CHK, rxq->flags) != gen_id)
 			break;
 
@@ -5064,7 +5113,7 @@ static void idpf_vport_intr_rel_irq(struct idpf_vport *vport,
 		irq_num = adapter->msix_entries[vidx].vector;
 
 		/* clear the affinity_mask in the IRQ descriptor */
-		irq_set_affinity_notifier(irq_num, NULL);
+		irq_set_affinity_hint(irq_num, NULL);
 		free_irq(irq_num, q_vector);
 		kfree(q_vector->name);
 		q_vector->name = NULL;
@@ -5178,7 +5227,7 @@ static void idpf_net_dim(struct idpf_q_vector *q_vector)
 
 	idpf_update_dim_sample(q_vector, &dim_sample, &q_vector->tx_dim,
 			       packets, bytes);
-	net_dim(&q_vector->tx_dim, &dim_sample);
+	net_dim(&q_vector->tx_dim, dim_sample);
 
 check_rx_itr:
 	if (!IDPF_ITR_IS_DYNAMIC(q_vector->rx_intr_mode))
@@ -5197,7 +5246,7 @@ check_rx_itr:
 
 	idpf_update_dim_sample(q_vector, &dim_sample, &q_vector->rx_dim,
 			       packets, bytes);
-	net_dim(&q_vector->rx_dim, &dim_sample);
+	net_dim(&q_vector->rx_dim, dim_sample);
 }
 
 /**
@@ -5228,33 +5277,6 @@ void idpf_vport_intr_update_itr_ena_irq(struct idpf_q_vector *q_vector)
 }
 
 /**
- * idpf_irq_affinity_notify - Callback for affinity changes
- * @notify: context as to what irq was changed
- * @mask: the new affinity mask
- *
- * Callback function registered via irq_set_affinity_notifier function
- * so that river can receive changes to the irq affinity masks.
- */
-static void
-idpf_irq_affinity_notify(struct irq_affinity_notify *notify,
-			 const cpumask_t *mask)
-{
-	struct idpf_q_vector *q_vector =
-		container_of(notify, struct idpf_q_vector, affinity_notify);
-
-	cpumask_copy(&q_vector->affinity_mask, mask);
-}
-
-/**
- * idpf_irq_affinity_release - Callback for affinity notifier release
- * @ref: internal core kernel usage
- *
- * Callback function registered via irq_set_affinity_notifier function to
- * inform the driver that it will no longer receive notifications.
- */
-static void idpf_irq_affinity_release(struct kref __always_unused *ref) {}
-
-/**
  * idpf_vport_intr_req_irq - get MSI-X vectors from the OS for the vport
  * @vport: main vport structure
  * @intr_grp: Interrupt resources
@@ -5265,7 +5287,6 @@ static int idpf_vport_intr_req_irq(struct idpf_vport *vport,
 				   char *basename)
 {
 	struct idpf_adapter *adapter = vport->adapter;
-	struct irq_affinity_notify *affinity_notify;
 	int vector, err, irq_num, vidx;
 	const char *vec_name;
 
@@ -5294,12 +5315,8 @@ static int idpf_vport_intr_req_irq(struct idpf_vport *vport,
 				   "Request_irq failed, error: %d\n", err);
 			goto free_q_irqs;
 		}
-
 		/* assign the mask for this irq */
-		affinity_notify = &q_vector->affinity_notify;
-		affinity_notify->notify = idpf_irq_affinity_notify;
-		affinity_notify->release = idpf_irq_affinity_release;
-		irq_set_affinity_notifier(irq_num, affinity_notify);
+		irq_set_affinity_hint(irq_num, &q_vector->affinity_mask);
 	}
 
 	return 0;
@@ -5592,7 +5609,7 @@ static int idpf_vport_splitq_napi_poll(struct napi_struct *napi, int budget)
 	/* Exit the polling mode, but don't re-enable interrupts if stack might
 	 * poll us due to busy-polling
 	 */
-	if (napi_complete_done(napi, work_done))
+	if (likely(napi_complete_done(napi, work_done)))
 		idpf_vport_intr_update_itr_ena_irq(q_vector);
 	else
 		idpf_vport_intr_set_wb_on_itr(q_vector);

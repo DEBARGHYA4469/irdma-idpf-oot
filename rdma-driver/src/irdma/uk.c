@@ -119,9 +119,7 @@ void irdma_clr_wqes(struct irdma_qp_uk *qp, u32 qp_wqe_idx)
  */
 void irdma_uk_qp_post_wr(struct irdma_qp_uk *qp)
 {
-	/* valid bit is written before ringing doorbell */
-	dma_wmb();
-
+	mb();
 	writel(qp->qp_id, qp->wqe_alloc_db);
 	qp->initial_ring.head = qp->sq_ring.head;
 }
@@ -200,6 +198,7 @@ static inline bool irdma_enable_push_wqe(struct irdma_qp_uk *qp, u32 total_size)
 		total_size <= qp->uk_attrs->max_hw_push_len) {
 		return true;
 	}
+
 	return false;
 }
 
@@ -1307,7 +1306,6 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	u8 polarity;
 	bool ext_valid;
 	__le64 *ext_cqe;
-	unsigned long flags;
 
 	if (cq->avoid_mem_cflct)
 		cqe = IRDMA_GET_CURRENT_EXTENDED_CQ_ELEM(cq);
@@ -1376,6 +1374,7 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 	info->q_type = (u8)FIELD_GET(IRDMA_CQ_SQ, qword3);
 	is_srq = (u8)FIELD_GET(IRDMA_CQ_SRQ, qword3);
 	info->error = (bool)FIELD_GET(IRDMA_CQ_ERROR, qword3);
+
 	info->push_dropped = (bool)FIELD_GET(IRDMACQ_PSHDROP, qword3);
 	info->ipv4 = (bool)FIELD_GET(IRDMACQ_IPV4, qword3);
 	get_64bit_val(cqe, 8, &comp_ctx);
@@ -1387,6 +1386,14 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		ret_code = -EFAULT;
 		goto exit;
 	}
+
+	if (info->error && qp->qp_type == IRDMA_QP_TYPE_ROCE_UD) {
+		info->error = false;
+		info->ud_error_masked = true;
+	} else {
+		info->ud_error_masked = false;
+	}
+
 	if (info->error) {
 		info->major_err = FIELD_GET(IRDMA_CQ_MAJERR, qword3);
 		info->minor_err = FIELD_GET(IRDMA_CQ_MINERR, qword3);
@@ -1405,19 +1412,7 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			info->comp_status = IRDMA_COMPL_STATUS_FLUSHED;
 			break;
 		default:
-#define IRDMA_CIE_SIGNATURE 0xE
-#define IRDMA_CQMAJERR_HIGH_NIBBLE GENMASK(15, 12)
-			if (info->q_type == IRDMA_CQE_QTYPE_SQ
-			    && qp->qp_type == IRDMA_QP_TYPE_ROCE_UD
-			    && FIELD_GET(IRDMA_CQMAJERR_HIGH_NIBBLE, info->major_err)
-			    == IRDMA_CIE_SIGNATURE) {
-				info->error = 0;
-				info->major_err = 0;
-				info->minor_err = 0;
-				info->comp_status = IRDMA_COMPL_STATUS_SUCCESS;
-			} else {
-				info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
-			}
+			info->comp_status = IRDMA_COMPL_STATUS_UNKNOWN;
 			break;
 		}
 	} else {
@@ -1447,9 +1442,7 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 		} else {
 			info->stag_invalid_set = false;
 		}
-		spin_lock_irqsave(srq->lock, flags);
 		IRDMA_RING_MOVE_TAIL(srq->srq_ring);
-		spin_unlock_irqrestore(srq->lock, flags);
 		pring = &srq->srq_ring;
 	} else if (info->q_type == IRDMA_CQE_QTYPE_RQ && !is_srq) {
 		u32 array_idx;
@@ -1466,6 +1459,8 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 
 		if (info->comp_status == IRDMA_COMPL_STATUS_FLUSHED ||
 		    info->comp_status == IRDMA_COMPL_STATUS_UNKNOWN) {
+			unsigned long flags;
+
 			spin_lock_irqsave(qp->lock, flags);
 			if (!IRDMA_RING_MORE_WORK(qp->rq_ring)) {
 				ret_code = -ENOENT;
@@ -1512,6 +1507,8 @@ int irdma_uk_cq_poll_cmpl(struct irdma_cq_uk *cq,
 			IRDMA_RING_SET_TAIL(qp->sq_ring,
 					    wqe_idx + qp->sq_wrtrk_array[wqe_idx].quanta);
 		} else {
+			unsigned long flags;
+
 			spin_lock_irqsave(qp->lock, flags);
 			if (!IRDMA_RING_MORE_WORK(qp->sq_ring)) {
 				spin_unlock_irqrestore(qp->lock, flags);

@@ -301,7 +301,6 @@ struct irdma_cqp_init_info {
 	u8 hmc_profile;
 	u8 ena_vf_count;
 	u8 ceqs_per_vf;
-	u8 timer_slots;
 	u8 ooisc_blksize;
 	u8 rrsp_blksize;
 	u8 q1_blksize;
@@ -479,7 +478,6 @@ struct irdma_sc_cqp {
 	u8 ena_vf_count;
 	u8 timeout_count;
 	u8 ceqs_per_vf;
-	u8 timer_slots;
 	u8 ooisc_blksize;
 	u8 rrsp_blksize;
 	u8 q1_blksize;
@@ -652,7 +650,7 @@ struct irdma_hmc_fpm_misc {
 	u32 max_ceqs;
 	u32 max_sds;
 	u32 loc_mem_pages;
-	u8 ird;
+	u16 ird;
 	u32 xf_block_size;
 	u32 q1_block_size;
 	u32 ht_multiplier;
@@ -688,7 +686,6 @@ struct irdma_config_check {
 	bool lfc_set:1;
 	bool pfc_set:1;
 	u8 traffic_class;
-	u8 prio;
 	u16 qs_handle;
 };
 
@@ -774,6 +771,12 @@ struct irdma_sc_dev {
 	u64 hw_stats_vf_regs[IRDMA_HW_STAT_INDEX_MAX_GEN_1];
 	u64 feature_info[IRDMA_MAX_FEATURES];
 	u64 cqp_cmd_stats[IRDMA_MAX_CQP_OPS];
+	u64 cqp_cmd_peak_latency[IRDMA_MAX_CQP_OPS];
+	u64 cqp_cmds_latency_2s;
+	u64 cqp_cmds_backlogged;  /* ONLY commands which were added to the overflow list. */
+	u64 cqp_backlog_curr;
+	u64 cqp_backlog_peak;
+	u64 missed_cq_arm;
 	struct irdma_hw_attrs hw_attrs;
 	struct irdma_hmc_info *hmc_info;
 	struct irdma_vchnl_if *vchnl_if;
@@ -796,7 +799,7 @@ struct irdma_sc_dev {
 	u32 vchnl_ver;
 	u16 num_vfs;
 	u16 hmc_fn_id;
-	u16 vf_id;
+	u8 vf_id;
 	bool privileged:1;
 	bool vchnl_up:1;
 	bool ceq_valid:1;
@@ -805,6 +808,8 @@ struct irdma_sc_dev {
 	bool multi_qs_enabled:1;
 	u8 protocol_used;
 	u64 hw_wa;	// Will have bit values for hw work arounds
+	u64 last_cqp_poll_ts;
+	u64 peak_cqp_poll_interval;
 	u32 wa_mem_pages;
 	u8 rrf_multiplier;
 	u8 xf_multiplier;
@@ -814,6 +819,7 @@ struct irdma_sc_dev {
 	int (*ws_add)(struct irdma_sc_vsi *vsi, u8 user_pri);
 	void (*ws_remove)(struct irdma_sc_vsi *vsi, u8 user_pri);
 	void (*ws_reset)(struct irdma_sc_vsi *vsi);
+	void **cq_table;
 };
 
 struct irdma_modify_cq_info {
@@ -1089,7 +1095,6 @@ struct irdma_udp_offload_info {
 };
 
 struct irdma_roce_offload_info {
-	u64 rca_key[2];
 	u16 p_key;
 	u32 err_rq_idx;
 	u32 qkey;
@@ -1261,8 +1266,16 @@ struct irdma_allocate_stag_info {
 	u16 access_rights;
 	bool remote_access:1;
 	bool use_hmc_fcn_index:1;
+	bool use_pf_rid:1;
 	bool all_memory:1;
 	bool remote_atomics_en:1;
+	bool pasid_valid:1;
+	u32 pasid;
+	bool use_aso:1;
+	u8 aso_host_id;
+	u8 aso_vm_vf_type;
+	u8 aso_vm_vf_num;
+	u8 aso_pf_num;
 	bool non_cached:1;
 	u8 placement_type;
 	u16 hmc_fcn_index;
@@ -1292,6 +1305,7 @@ struct irdma_reg_ns_stag_info {
 	irdma_stag_key stag_key;
 	bool use_hmc_fcn_index:1;
 	u16 hmc_fcn_index;
+	bool use_pf_rid:1;
 	bool all_memory:1;
 	bool pasid_valid:1;
 	u8 remote_atomics_en;
@@ -1320,6 +1334,7 @@ struct irdma_fast_reg_stag_info {
 	bool push_wqe:1;
 	bool use_hmc_fcn_index:1;
 	u16 hmc_fcn_index;
+	bool use_pf_rid:1;
 	bool defer_flag:1;
 	bool remote_atomics_en:1;
 };
@@ -1329,6 +1344,7 @@ struct irdma_dealloc_stag_info {
 	u32 pd_id;
 	bool mr:1;
 	bool dealloc_pbl:1;
+	bool skip_flush_markers:1;
 };
 
 struct irdma_register_shared_stag {
@@ -1870,7 +1886,6 @@ struct cqp_cmds_info {
 	u8 cqp_cmd;
 	u8 post_sq;
 	struct cqp_info in;
-	int cqp_cmd_exec_status;
 	bool create;
 };
 

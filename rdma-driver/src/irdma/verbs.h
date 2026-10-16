@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB */
-/* Copyright (c) 2015 - 2024 Intel Corporation */
+/* Copyright (c) 2015 - 2023 Intel Corporation */
 #ifndef IRDMA_VERBS_H
 #define IRDMA_VERBS_H
 
@@ -81,9 +81,10 @@ struct irdma_ah {
 	u8 sgid_index;
 	union ib_gid dgid;
 	struct hlist_node list;
-	refcount_t refcnt;
+	u64 refcnt;
 	struct irdma_ah *parent_ah;	/* AH from cached list */
-	bool sleep;
+	struct list_head node;
+	u64 deletion_timestamp;
 };
 
 struct irdma_hmc_pble {
@@ -144,7 +145,7 @@ struct irdma_mr {
 	int access;
 	u8 is_hwreg;
 	u16 type;
-	bool dma_mr:1;
+	bool dma_mr;
 	u32 page_cnt;
 	u64 page_size;
 	u64 page_msk;
@@ -160,7 +161,7 @@ struct irdma_mr {
 
 struct irdma_srq {
 	struct ib_srq ibsrq;
-	struct irdma_sc_srq sc_srq __aligned(64);
+	struct irdma_sc_srq sc_srq;
 	struct irdma_dma_mem kmem;
 	struct completion free_srq;
 	u64 *srq_wrid_mem;
@@ -179,7 +180,7 @@ struct irdma_cq {
 	struct irdma_sc_cq sc_cq;
 	u16 cq_head;
 	u16 cq_size;
-	u16 cq_num;
+	u32 cq_num;
 	bool user_mode;
 	atomic_t armed;
 	enum irdma_cmpl_notify last_notify;
@@ -269,6 +270,7 @@ struct irdma_qp {
 	dma_addr_t pbl_pbase;
 	struct page *page;
 	u8 iwarp_state;
+	bool flush_oneshot;
 	atomic_t flush_issued;
 	u16 term_sq_flush_code;
 	u16 term_rq_flush_code;
@@ -441,18 +443,6 @@ irdma_user_mmap_entry_add_hash(struct irdma_ucontext *ucontext, u64 bar_offset,
 			       enum irdma_mmap_flag mmap_flag, u64 *mmap_offset);
 void irdma_user_mmap_entry_del_hash(struct irdma_user_mmap_entry *entry);
 #endif /* RDMA_MMAP_DB_SUPPORT */
-#ifndef SET_BEST_PAGE_SZ_V1
-struct irdma_mr *irdma_alloc_iwmr(struct ib_umem *region,
-				  struct ib_pd *pd, u64 virt,
-				  enum irdma_memreg_type reg_type);
-#else
-struct irdma_mr *irdma_alloc_iwmr(struct ib_umem *region,
-				  struct ib_pd *pd, u64 virt, u64 start,
-				  enum irdma_memreg_type reg_type);
-#endif /* !SET_BEST_PAGE_SZ_V1 */
-void irdma_free_iwmr(struct irdma_mr *iwmr);
-int irdma_reg_user_mr_type_mem(struct irdma_mr *iwmr, int access,
-			       bool create_stag);
 int irdma_ib_register_device(struct irdma_device *iwdev);
 void irdma_ib_unregister_device(struct irdma_device *iwdev);
 void irdma_ib_qp_event(struct irdma_qp *iwqp, enum irdma_qp_event_type event);

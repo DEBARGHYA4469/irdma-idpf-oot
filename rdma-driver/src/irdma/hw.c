@@ -4,6 +4,33 @@
 
 extern unsigned int irdma_rca_rq_size;
 
+static struct irdma_rsrc_limits rsrc_limits_table[] = {
+	[0] = {
+		.qplimit = SZ_128,
+	},
+	[1] = {
+		.qplimit = SZ_1K,
+	},
+	[2] = {
+		.qplimit = SZ_2K,
+	},
+	[3] = {
+		.qplimit = SZ_4K,
+	},
+	[4] = {
+		.qplimit = SZ_16K,
+	},
+	[5] = {
+		.qplimit = SZ_64K,
+	},
+	[6] = {
+		.qplimit = SZ_128K,
+	},
+	[7] = {
+		.qplimit = SZ_256K,
+	},
+};
+
 /* types of hmc objects */
 static enum irdma_hmc_rsrc_type iw_hmc_obj_types[] = {
 	IRDMA_HMC_IW_QP,
@@ -33,7 +60,7 @@ static enum irdma_hmc_rsrc_type iw_hmc_obj_types[] = {
  * irdma_iwarp_ce_handler - handle iwarp completions
  * @iwcq: iwarp cq receiving event
  */
-static void irdma_iwarp_ce_handler(struct irdma_sc_cq *iwcq)
+void irdma_iwarp_ce_handler(struct irdma_sc_cq *iwcq)
 {
 	struct irdma_cq *cq = iwcq->back_cq;
 
@@ -85,15 +112,33 @@ void irdma_process_ceq(struct irdma_pci_f *rf, struct irdma_ceq *ceq)
 	struct irdma_sc_dev *dev = &rf->sc_dev;
 	struct irdma_sc_ceq *sc_ceq;
 	struct irdma_sc_cq *cq;
+	void *temp_cq;
 	unsigned long flags;
 
 	sc_ceq = &ceq->sc_ceq;
 	do {
 		spin_lock_irqsave(&ceq->ce_lock, flags);
-		cq = irdma_sc_process_ceq(dev, sc_ceq);
-		if (!cq) {
+		temp_cq = irdma_sc_process_ceq(dev, sc_ceq);
+		if (!temp_cq) {
 			spin_unlock_irqrestore(&ceq->ce_lock, flags);
 			break;
+		}
+
+		if (rf->sc_dev.hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_3) {
+			/* The first entry in the LUT is an irdma_sc_cq for CQ0,
+			 * so check for it directly. All other values are of
+			 * type irdma_cq.
+			 */
+			if (temp_cq == &rf->ccq.sc_cq) {
+				cq = &rf->ccq.sc_cq;
+			} else {
+				struct irdma_cq *icq = temp_cq;
+				cq = &icq->sc_cq;
+			}
+			/* GEN3 irdma_sc_process_ceq doesn't ack. */
+			writel(cq->cq_uk.cq_id, cq->cq_uk.cq_ack_db);
+		} else {
+			cq = temp_cq;
 		}
 
 		if (cq->cq_type == IRDMA_CQ_TYPE_IWARP)
@@ -143,6 +188,13 @@ static void irdma_set_flush_fields(struct irdma_sc_qp *qp,
 static void irdma_complete_cqp_request(struct irdma_cqp *cqp,
 				       struct irdma_cqp_request *cqp_request)
 {
+	struct irdma_sc_dev* dev = cqp->sc_cqp.dev;
+	const u64 duration = ktime_get_raw_ns() - cqp_request->submission_ts;
+
+	if (duration > 2000000000) dev->cqp_cmds_latency_2s++;
+	if (duration > dev->cqp_cmd_peak_latency[cqp_request->info.cqp_cmd])
+		dev->cqp_cmd_peak_latency[cqp_request->info.cqp_cmd] = duration;
+
 	WRITE_ONCE(cqp_request->request_done, true);
 	if (cqp_request->waiting)
 		wake_up(&cqp_request->waitq);
@@ -179,8 +231,10 @@ static void irdma_process_ae_def_cmpl(struct irdma_pci_f *rf,
 /**
  * irdma_process_aeq - handle aeq events
  * @rf: RDMA PCI function
+ *
+ * Return: True if an AE was processed.
  */
-void irdma_process_aeq(struct irdma_pci_f *rf)
+bool irdma_process_aeq(struct irdma_pci_f *rf)
 {
 	struct irdma_sc_dev *dev = &rf->sc_dev;
 	struct irdma_aeq *aeq = &rf->aeq;
@@ -196,11 +250,12 @@ void irdma_process_aeq(struct irdma_pci_f *rf)
 	struct irdma_srq *iwsrq;
 	u64 srq_id;
 	unsigned long flags;
+	bool work_done = false;
 
 	u32 aeqcnt = 0;
 
 	if (!sc_aeq->size)
-		return;
+		return work_done;
 
 	do {
 		memset(info, 0, sizeof(*info));
@@ -212,9 +267,10 @@ void irdma_process_aeq(struct irdma_pci_f *rf)
 			ibdev_err(&iwdev->ibdev, "AEQ has overflowed\n");
 			rf->reset = true;
 			rf->gen_ops.request_reset(rf);
-			return;
+			return work_done;
 		}
 
+		work_done = true;
 		aeqcnt++;
 		atomic_inc(&iwdev->ae_info.ae_cnt);
 
@@ -451,6 +507,8 @@ void irdma_process_aeq(struct irdma_pci_f *rf)
 
 	if (aeqcnt)
 		irdma_sc_repost_aeq_entries(dev, aeqcnt);
+
+	return work_done;
 }
 
 /**
@@ -478,7 +536,11 @@ static irqreturn_t irdma_aeq_ceq0_irq_thread(int irq, void *private)
 		irdma_ena_intr(&rf->sc_dev, rf->iw_msixtbl[0].idx);
 		return IRQ_HANDLED;
 	}
-	irdma_process_aeq(rf);
+
+	/* If there was no AE, then it means there was an interrupt for CEQ0. */
+	if (!irdma_process_aeq(rf))
+		atomic_set(&rf->ceq0_int_good, 1);
+
 	irdma_ena_intr(&rf->sc_dev, rf->iw_msixtbl[0].idx);
 
 	return IRQ_HANDLED;
@@ -546,7 +608,7 @@ static int irdma_save_msix_info(struct irdma_pci_f *rf)
 
 	size = sizeof(struct irdma_msix_vector) * rf->msix_count;
 	size += sizeof(*iw_qvlist);
-	size += sizeof(*iw_qvinfo) * (rf->msix_count - 1);
+	size += sizeof(*iw_qvinfo) * rf->msix_count - 1;
 	rf->iw_msixtbl = kzalloc(size, GFP_KERNEL);
 	if (!rf->iw_msixtbl)
 		return -ENOMEM;
@@ -1095,7 +1157,6 @@ static int irdma_create_cqp(struct irdma_pci_f *rf)
 	cqp_init_info.rq_scratch_array = cqp->rq_scratch_array;
 	cqp_init_info.protocol_used = rf->protocol_used;
 	cqp_init_info.en_rem_endpoint_trk = rf->en_rem_endpoint_trk;
-	cqp_init_info.timer_slots = rf->timer_slots;
 	memcpy(&cqp_init_info.dcqcn_params, &rf->dcqcn_params,
 	       sizeof(cqp_init_info.dcqcn_params));
 
@@ -1178,13 +1239,12 @@ static int irdma_create_ccq(struct irdma_pci_f *rf)
 	struct irdma_ccq_init_info info = {};
 	struct irdma_ccq *ccq = &rf->ccq;
 	int status;
-	int ccq_size = (rf->rdma_ver >= IRDMA_GEN_3) ? IW_GEN_3_CCQ_SIZE : IW_CCQ_SIZE;
 
 	dev->ccq = &ccq->sc_cq;
 	dev->ccq->dev = dev;
 	info.dev = dev;
 	ccq->shadow_area.size = sizeof(struct irdma_cq_shadow_area);
-	ccq->mem_cq.size = ALIGN(sizeof(struct irdma_cqe) * ccq_size,
+	ccq->mem_cq.size = ALIGN(sizeof(struct irdma_cqe) * IW_CCQ_SIZE,
 				 IRDMA_CQ0_ALIGNMENT);
 	ccq->mem_cq.va = dma_alloc_coherent(dev->hw->device, ccq->mem_cq.size,
 					    &ccq->mem_cq.pa, GFP_KERNEL);
@@ -1201,7 +1261,7 @@ static int irdma_create_ccq(struct irdma_pci_f *rf)
 	/* populate the ccq init info */
 	info.cq_base = ccq->mem_cq.va;
 	info.cq_pa = ccq->mem_cq.pa;
-	info.num_elem = ccq_size;
+	info.num_elem = IW_CCQ_SIZE;
 	info.shadow_area = ccq->shadow_area.va;
 	info.shadow_area_pa = ccq->shadow_area.pa;
 	info.ceqe_mask = false;
@@ -1727,6 +1787,8 @@ static int irdma_hmc_setup(struct irdma_pci_f *rf)
 	int status;
 	u32 qpcnt;
 
+	qpcnt = rsrc_limits_table[rf->limits_sel].qplimit;
+
 	qpcnt = IRDMA_MAX_MEV_QPCNT;
 	rf->sd_type = IRDMA_SD_TYPE_DIRECT;
 	status = irdma_cfg_fpm_val(dev, qpcnt);
@@ -1950,7 +2012,7 @@ void irdma_ctrl_deinit_hw(struct irdma_pci_f *rf)
 {
 	enum init_completion_state state = rf->init_state;
 
-	if ((rf->sc_dev.hw_wa & TIMER_NEEDED) && rf->poll_thread) {
+	if (rf->poll_thread) {
 		kthread_stop(rf->poll_thread);
 		rf->poll_thread = NULL;
 	}
@@ -2078,6 +2140,13 @@ int irdma_rt_init_hw(struct irdma_device *iwdev,
 			}
 			iwdev->init_state = AEQ_CREATED;
 			rf->rsrc_created = true;
+
+			if (!atomic_read(&rf->ceq0_int_good)) {
+				printk(KERN_ERR
+				       "irdma: No CEQ-0 interrupt detected, "
+				       "falling back to poll mode\n");
+				atomic_set(&rf->ceq0_wa_enable, 1);
+			}
 		}
 
 		if (iwdev->rf->sc_dev.hw_attrs.uk_attrs.hw_rev == IRDMA_GEN_1)
@@ -2192,6 +2261,11 @@ static void irdma_set_hw_rsrc(struct irdma_pci_f *rf)
 	rf->qp_table = (struct irdma_qp **)
 		(&rf->allocated_arps[BITS_TO_LONGS(rf->arp_table_size)]);
 	rf->cq_table = (struct irdma_cq **)(&rf->qp_table[rf->max_qp]);
+
+	/* ctrl.c needs CQ table. Store fixed CQ0 entry in the first slot. */
+	rf->sc_dev.cq_table = (void **)rf->cq_table;
+	rf->sc_dev.cq_table[0] = &rf->ccq.sc_cq;
+
 	rf->srq_table = (struct irdma_srq **)(&rf->cq_table[rf->max_cq]);
 
 	spin_lock_init(&rf->rsrc_lock);
@@ -2830,6 +2904,8 @@ void irdma_del_apbvt(struct irdma_device *iwdev,
 void irdma_arp_cqp_op(struct irdma_pci_f *rf, u16 arp_index,
 		      const unsigned char *mac_addr, u32 action)
 {
+	/* Skip generating ARP CQP ops. */
+#if 0
 	struct irdma_add_arp_cache_entry_info *info;
 	struct irdma_cqp_request *cqp_request;
 	struct cqp_cmds_info *cqp_info;
@@ -2860,6 +2936,7 @@ void irdma_arp_cqp_op(struct irdma_pci_f *rf, u16 arp_index,
 	cqp_info->post_sq = 1;
 	irdma_handle_cqp_op(rf, cqp_request);
 	irdma_put_cqp_request(&rf->cqp, cqp_request);
+#endif
 }
 
 /**
@@ -3123,12 +3200,10 @@ void irdma_flush_wqes(struct irdma_qp *iwqp, u32 flush_mask)
 	struct irdma_qp_flush_info info = {};
 	struct irdma_pci_f *rf = iwqp->iwdev->rf;
 	u8 flush_code = iwqp->sc_qp.flush_code;
+	bool sched_flush = false;
 
 	if ((!(flush_mask & IRDMA_FLUSH_SQ) && !(flush_mask & IRDMA_FLUSH_RQ)) ||
 	    ((flush_mask & IRDMA_REFLUSH) && rf->rdma_ver >= IRDMA_GEN_3))
-		return;
-
-	if (atomic_cmpxchg(&iwqp->flush_issued, 0, 1))
 		return;
 
 	/* Set flush info fields*/
@@ -3161,10 +3236,18 @@ void irdma_flush_wqes(struct irdma_qp *iwqp, u32 flush_mask)
 		if (irdma_upload_context && irdma_upload_qp_context(iwqp, 0, 1))
 			ibdev_warn(&iwqp->iwdev->ibdev, "failed to upload QP context\n");
 		if (!iwqp->user_mode)
-			irdma_sched_qp_flush_work(iwqp);
+			sched_flush = true;
 	}
 
 	/* Issue flush */
 	(void)irdma_hw_flush_wqes(rf, &iwqp->sc_qp, &info,
 				  flush_mask & IRDMA_FLUSH_WAIT);
+
+	/* Set "hardware flush done" flag. */
+	atomic_set(&iwqp->flush_issued, 1);
+
+	if (sched_flush) {
+		/* Moved the flush to after the HW flush is done. */
+		irdma_sched_qp_flush_work(iwqp);
+	}
 }

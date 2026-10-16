@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #include "idpf.h"
 #ifdef HAVE_NETDEV_BPF_XSK_POOL
@@ -607,7 +607,7 @@ int idpf_xsk_splitq_async_xmit(struct net_device *netdev, u32 q_id)
 
 	rcu_read_lock();
 	if (unlikely(test_bit(IDPF_HR_RESET_IN_PROG, np->adapter->flags) ||
-		     mutex_is_locked(&np->adapter->vport_cfg_lock))) {
+		     mutex_is_locked(&np->adapter->vport_ctrl_lock))) {
 		ret = -EBUSY;
 		goto exit;
 	}
@@ -658,7 +658,7 @@ int idpf_xsk_singleq_async_xmit(struct net_device *netdev, u32 q_id)
 	int ret;
 
 	rcu_read_lock();
-	if (unlikely(mutex_is_locked(&np->adapter->vport_cfg_lock))) {
+	if (unlikely(mutex_is_locked(&np->adapter->vport_ctrl_lock))) {
 		ret = -EBUSY;
 		goto exit;
 	}
