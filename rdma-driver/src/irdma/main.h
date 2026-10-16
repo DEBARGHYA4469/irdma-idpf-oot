@@ -64,6 +64,7 @@ extern bool irdma_upload_context;
 #define MEV_PCI_VER_A0	0
 #define MEV_PCI_VER_B0	16
 #define MEV_PCI_VER_C0	32
+#define MEV_PCI_VER_C1  33
 
 extern bool irdma_rca_ena;
 extern bool irdma_rca_rq_post;
@@ -84,10 +85,9 @@ extern struct auxiliary_driver i40iw_auxiliary_drv;
 #define IRDMA_MACIP_ADD		1
 #define IRDMA_MACIP_DELETE	2
 
-#define IW_CCQ_SIZE		(IRDMA_CQP_SW_SQSIZE_2048 + 2)
-#define IW_GEN_3_CCQ_SIZE	(2*IRDMA_CQP_SW_SQSIZE_2048 + 2)
-#define IW_CEQ_SIZE		2048
-#define IW_AEQ_SIZE		2048
+#define IW_CCQ_SIZE	((IRDMA_CQP_SW_SQSIZE_2048 * 2) + 2)
+#define IW_CEQ_SIZE	2048
+#define IW_AEQ_SIZE	2048
 
 #define RX_BUF_SIZE	(1536 + 8)
 #define IW_REG0_SIZE	(4 * 1024)
@@ -198,6 +198,7 @@ struct irdma_cqp_request {
 	bool waiting:1;
 	bool dynamic:1;
 	bool pending:1;
+	u64 submission_ts;
 };
 
 struct irdma_cqp {
@@ -343,7 +344,6 @@ struct irdma_pci_f {
 	u32 next_ws_node_id;
 	u32 max_ws_node_id;
 	u32 limits_sel;
-	u8 timer_slots;
 	unsigned long *allocated_ws_nodes;
 	unsigned long *allocated_qps;
 	unsigned long *allocated_cqs;
@@ -395,6 +395,8 @@ struct irdma_pci_f {
 	u8 vlan_parse_en;
 	struct delayed_work dwork_cqp_poll;
 	u32 chk_stag;
+	atomic_t ceq0_int_good;
+	atomic_t ceq0_wa_enable;
 };
 
 struct irdma_ae_info {
@@ -419,17 +421,17 @@ struct irdma_device {
 	struct irdma_cm_core cm_core;
 	struct irdma_ae_info ae_info;
 	DECLARE_HASHTABLE(ah_hash_tbl, 8);
-	DECLARE_HASHTABLE(ah_kernel_hash_tbl, 8);
-	struct mutex ah_tbl_lock;
-	spinlock_t ah_kernel_tbl_lock;
+	struct list_head ah_deletion_list;
+	u32 ah_deletion_list_cnt;
+	u32 ah_deletion_list_cnt_total;
+	u32 ah_deletion_list_cnt_peak;
+	spinlock_t ah_tbl_lock;
+	struct mutex delete_lock;
 #ifdef CONFIG_DEBUG_FS
 	u64 ah_reused;
-	u64 ah_kernel_reused;
 #endif
 	u32 ah_list_cnt;
 	u32 ah_list_hwm;
-	u32 ah_kernel_list_cnt;
-	u32 ah_kernel_list_hwm;
 	u32 roce_cwnd;
 	u32 roce_ackcreds;
 	u32 vendor_id;
@@ -479,6 +481,14 @@ struct irdma_device {
 	int name_id;
 #endif
 	char ib_devname[IB_DEVICE_NAME_MAX];
+	struct {
+		atomic_t posted_send_wrs;
+		atomic_t posted_recv_wrs;
+		atomic_t completed_send_wrs;
+		atomic_t completed_recv_wrs;
+		atomic_t masked_error_wrs;
+	} mad_qp_stats;
+	atomic_t cq_polls;
 };
 
 struct irdma_handler {
@@ -633,7 +643,7 @@ void irdma_del_local_mac_entry(struct irdma_pci_f *rf, u16 idx);
 const char *irdma_get_ae_desc(u16 ae_id);
 
 void irdma_process_ceq(struct irdma_pci_f *rf, struct irdma_ceq *ceq);
-void irdma_process_aeq(struct irdma_pci_f *rf);
+bool irdma_process_aeq(struct irdma_pci_f *rf);
 
 u32 irdma_initialize_hw_rsrc(struct irdma_pci_f *rf);
 void irdma_port_ibevent(struct irdma_device *iwdev);
@@ -701,6 +711,7 @@ int irdma_ah_cqp_op(struct irdma_pci_f *rf, struct irdma_sc_ah *sc_ah, u8 cmd,
 		    void (*callback_fcn)(struct irdma_cqp_request *cqp_request),
 		    void *cb_param);
 bool irdma_cq_empty(struct irdma_cq *iwcq);
+void irdma_iwarp_ce_handler(struct irdma_sc_cq *iwcq);
 #if IS_ENABLED(CONFIG_CONFIGFS_FS)
 struct irdma_device *irdma_get_device_by_name(const char *name);
 #endif

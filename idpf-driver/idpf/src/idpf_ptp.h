@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #ifndef _IDPF_PTP_H_
 #define _IDPF_PTP_H_
@@ -9,8 +9,6 @@
 #include <linux/kthread.h>
 #include <linux/ptp_clock_kernel.h>
 #include <linux/ptp_classify.h>
-
-#define IDPF_PTP_VALID_BIT BIT(0)
 
 enum idpf_ptp_access {
 	IDPF_PTP_NONE = 0,
@@ -112,8 +110,8 @@ struct idpf_ptp_vport_tx_tstamp_caps {
 	u32 vport_id;
 	u16 num_entries;
 	u8 tstamp_ns_lo_bit;
-	spinlock_t lock_in_use; /* lock to used latches list */
-	spinlock_t lock_free; /* lock to free latches list */
+	struct mutex lock_in_use; /* lock to used latches list */
+	struct mutex lock_free; /* lock to free latches list */
 	struct list_head latches_free;
 	struct list_head latches_in_use;
 	struct idpf_ptp_tx_tstamp_status *tx_tstamp_status;
@@ -150,15 +148,13 @@ struct idpf_ptp {
 	u64 max_adj;
 	u64 cached_phc_time;
 	unsigned long cached_phc_jiffies;
+	struct kthread_delayed_work work;
+	struct kthread_worker *kworker;
 	enum idpf_ptp_access get_dev_clk_time_access;
 	enum idpf_ptp_access get_cross_tstamp_access;
 	enum idpf_ptp_access set_dev_clk_time_access;
 	enum idpf_ptp_access adj_dev_clk_time_access;
 	enum idpf_ptp_access tx_tstamp_access;
-#ifndef HAVE_PTP_CANCEL_WORKER_SYNC
-	struct kthread_delayed_work work;
-	struct kthread_worker *kworker;
-#endif /* !HAVE_PTP_CANCEL_WORKER_SYNC */
 };
 
 struct idpf_ptp_dev_timers {
@@ -168,10 +164,9 @@ struct idpf_ptp_dev_timers {
 
 #if IS_ENABLED(CONFIG_PTP_1588_CLOCK)
 int idpf_ptp_get_caps(struct idpf_adapter *adapter);
-int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport);
 bool idpf_ptp_is_cap_ena(struct idpf_adapter *adapter, u32 cap);
 void idpf_ptp_get_features_access(struct idpf_adapter *adapter);
-int idpf_ptp_init(struct idpf_adapter *adapter);
+int idpf_ptp_init(struct idpf_adapter *adpater);
 void idpf_ptp_release(struct idpf_adapter *adapter);
 int idpf_ptp_get_dev_clk_time(struct idpf_adapter *adapter,
 			      struct idpf_ptp_dev_timers *dev_clk_time);
@@ -180,48 +175,14 @@ int idpf_ptp_get_cross_time(struct idpf_adapter *adapter,
 int idpf_ptp_set_dev_clk_time(struct idpf_adapter *adapter, u64 time);
 int idpf_ptp_adj_dev_clk_fine(struct idpf_adapter *adapter, u64 incval);
 int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter, s64 delta);
-int idpf_ptp_get_tx_tstamp_mb(struct idpf_vport *vport);
 int idpf_ptp_get_tx_tstamp(struct idpf_vport *vport);
-int idpf_ptp_get_tstamp_config(struct idpf_vport *vport, struct ifreq *ifr);
-int idpf_ptp_set_tstamp_config(struct idpf_vport *vport, struct ifreq *ifr);
-s8 idpf_ptp_request_tstamp_idx(struct idpf_vport *vport, struct sk_buff *skb);
-u64 idpf_ptp_extend_tstamp(struct idpf_adapter *adapter, u64 in_tstamp);
-
-/**
- * idpf_ptp_tstamp_extend_32b_to_64b - Convert a sub-32b nanoseconds Tx timestamp
- *				   to 64b
- * @cached_phc_time: recently cached copy of PHC time
- * @in_timestamp: Ingress/egress sub-32b nanoseconds timestamp value
- *
- * Hardware captures timestamps which contain only sub-32 bits of nominal
- * nanoseconds, as opposed to the 64bit timestamps that the stack expects.
- */
-static inline u64 idpf_ptp_tstamp_extend_32b_to_64b(u64 cached_phc_time,
-						    u32 in_timestamp)
-{
-	u32 delta, phc_lo;
-	u64 ns;
-
-	phc_lo = (u32)cached_phc_time;
-	delta = (in_timestamp - phc_lo);
-
-	if (delta > U32_MAX / 2) {
-		delta = phc_lo - in_timestamp;
-		ns = cached_phc_time - delta;
-	} else {
-		ns = cached_phc_time + delta;
-	}
-
-	return ns;
-}
-
+int idpf_ptp_get_ts_config(struct idpf_vport *vport, struct ifreq *ifr);
+int idpf_ptp_set_ts_config(struct idpf_vport *vport, struct ifreq *ifr);
+s8 idpf_ptp_request_ts(struct idpf_vport *vport, struct sk_buff *skb);
+u64 idpf_ptp_extend_ts(struct idpf_adapter *adapter, u32 in_tstamp);
+u64 idpf_ptp_tstamp_extend_32b_to_64b(u64 cached_phc_time, u32 in_timestamp);
 #else /* IS_ENABLED(CONFIG_PTP_1588_CLOCK) */
 static inline int idpf_ptp_get_caps(struct idpf_adapter *adapter)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int idpf_ptp_get_vport_tstamps_caps(struct idpf_vport *vport)
 {
 	return -EOPNOTSUPP;
 }
@@ -233,9 +194,10 @@ static inline bool idpf_ptp_is_cap_ena(struct idpf_adapter *adapter, u32 cap)
 
 static inline void idpf_ptp_get_features_access(struct idpf_adapter *adapter) { }
 
-static inline int idpf_ptp_init(struct idpf_adapter *adapter)
+static inline int idpf_ptp_init(struct idpf_adapter *adpater)
 {
-	return -EOPNOTSUPP;
+	dev_err(&adapter->pdev->dev, "PTP not supported when CONFIG_PTP_1588_CLOCK is disabled\n");
+	return 0;
 }
 
 static inline void idpf_ptp_release(struct idpf_adapter *adapter) { }
@@ -270,36 +232,31 @@ static inline int idpf_ptp_adj_dev_clk_time(struct idpf_adapter *adapter,
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_get_tx_tstamp_mb(struct idpf_vport *vport)
-{
-	return -EOPNOTSUPP;
-}
-
 static inline int idpf_ptp_get_tx_tstamp(struct idpf_vport *vport)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_get_tstamp_config(struct idpf_vport *vport,
-					     struct ifreq *ifr)
+static inline int idpf_ptp_get_ts_config(struct idpf_vport *vport,
+					 struct ifreq *ifr)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline int idpf_ptp_set_tstamp_config(struct idpf_vport *vport,
-					     struct ifreq *ifr)
+static inline int idpf_ptp_set_ts_config(struct idpf_vport *vport,
+					 struct ifreq *ifr)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline s8 idpf_ptp_request_tstamp_idx(struct idpf_vport *vport,
-					     struct sk_buff *skb)
+static inline s8 idpf_ptp_request_ts(struct idpf_vport *vport,
+				     struct sk_buff *skb)
 {
 	return -1;
 }
 
-static inline u64 idpf_ptp_extend_tstamp(struct idpf_adapter *adapter,
-					 u64 in_tstamp)
+static inline u64 idpf_ptp_extend_ts(struct idpf_adapter *adapter,
+				     u32 in_tstamp)
 {
 	return 0;
 }
@@ -309,6 +266,5 @@ static inline u64 idpf_ptp_tstamp_extend_32b_to_64b(u64 cached_phc_time,
 {
 	return 0;
 }
-
 #endif /* IS_ENABLED(CONFIG_PTP_1588_CLOCK) */
 #endif /* _IDPF_PTP_H_ */

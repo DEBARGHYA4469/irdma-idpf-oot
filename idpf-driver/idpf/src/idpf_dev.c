@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #include "idpf.h"
 #include "idpf_lan_pf_regs.h"
@@ -209,6 +209,15 @@ static void idpf_ptp_reg_init(struct idpf_adapter *adapter)
  */
 static int idpf_idc_register(struct idpf_adapter *adapter)
 {
+#ifdef CONFIG_RCA_SUPPORT
+	int err;
+
+	adapter->rca_data.rca_en = true;
+	err = idpf_idc_init_aux_device(&adapter->rca_data, IIDC_FUNCTION_TYPE_PF);
+	if (err)
+		return err;
+
+#endif /* CONFIG_RCA_SUPPORT */
 	return idpf_idc_init_aux_device(&adapter->rdma_data, IIDC_FUNCTION_TYPE_PF);
 }
 

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0 or Linux-OpenIB-only */
-/* Copyright (C) 2018-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #ifndef _IIDC_H_
 #define _IIDC_H_
@@ -25,7 +25,7 @@
  * an appropriate message.
  */
 #define IIDC_MAJOR_VER		10
-#define IIDC_MINOR_VER		4
+#define IIDC_MINOR_VER		3
 
 enum iidc_event_type {
 	IIDC_EVENT_BEFORE_MTU_CHANGE,
@@ -163,6 +163,18 @@ struct iidc_vf_port_info {
 	u16 port_vlan_tpid;
 };
 
+struct iidc_notifier_block {
+	/* This event_handler is meant to be a blocking call.  For instance,
+	 * when a BEFORE_MTU_CHANGE event comes in, the event_handler will not
+	 * return until the auxiliary driver is ready for the MTU change to
+	 * happen.
+	 */
+	void (*event_handler)(struct iidc_core_dev_info *cdev_info,
+			      struct iidc_event *event);
+	int (*vc_receive)(struct iidc_core_dev_info *cdev_info, u32 vf_id,
+			  u8 *msg, u16 len);
+};
+
 /* Following APIs are implemented by core PCI driver */
 struct iidc_core_ops {
 	/* APIs to allocate resources such as VEB, VSI, Doorbell queues,
@@ -192,6 +204,9 @@ struct iidc_core_ops {
 			       struct iidc_rdma_multi_qset_params *qset);
 	int (*free_multi_res)(struct iidc_core_dev_info *cdev_info,
 			      struct iidc_rdma_multi_qset_params *qset);
+	int (*register_notifier)(struct iidc_core_dev_info *cdev_info,
+				 const struct iidc_notifier_block *nb);
+	int (*unregister_notifier)(struct iidc_core_dev_info *cdev_info);
 };
 
 #define IIDC_RDMA_ROCE_NAME	"roce"
@@ -209,28 +224,6 @@ struct iidc_core_ops {
 struct cdev_info_id {
 	char *name;
 	int id;
-};
-
-#define IIDC_RDMA_INFO   { .name = IIDC_RDMA_ROCE_NAME, .id = IIDC_RDMA_ID },
-#define IIDC_IEPS_INFO   { .name = IIDC_IEPS_NAME,  .id = IIDC_IEPS_ID },
-
-#define ASSIGN_IIDC_INFO	\
-{				\
-	IIDC_IEPS_INFO		\
-	IIDC_RDMA_INFO		\
-}
-
-#define IIDC_IEPS_NAC_MODE_M       0x3
-
-enum iidc_ieps_nac_mode {
-	/* Single NAC - Secondary */
-	IIDC_IEPS_NAC_MODE_1B = 0x0,
-	/* Single NAC - Primary */
-	IIDC_IEPS_NAC_MODE_1A = 0x1,
-	/* Dual NAC - Secondary */
-	IIDC_IEPS_NAC_MODE_2_SECONDARY = 0x2,
-	/* Dual NAC - Primary */
-	IIDC_IEPS_NAC_MODE_2_PRIMARY = 0x3,
 };
 
 enum iidc_function_type {
@@ -276,6 +269,11 @@ struct iidc_core_dev_info {
 	 * by core PCI driver and called by auxiliary driver
 	 */
 	const struct iidc_core_ops *ops;
+	/* The aux bus driver can subscribe to events and VC responses
+	 * from the core PCI driver. This lock protects the registration.
+	 */
+	struct mutex iidc_notifier_lock;
+	struct iidc_notifier_block notifiers;
 	u8 pf_id;
 	u8 main_pf_port;
 	u8 rdma_active_port;
@@ -285,7 +283,6 @@ struct iidc_core_dev_info {
 	u8 rdma_ports[2];
 	u8 bond_aa; /* is 1 if the bond is a supported active-active mode */
 	u8 rdma_port_bitmap; /* bitmap of port's link on active-active bond */
-	enum iidc_ieps_nac_mode nac_mode; /* NAC Topology */
 };
 
 struct iidc_auxiliary_dev {
@@ -300,15 +297,6 @@ struct iidc_auxiliary_dev {
  */
 struct iidc_auxiliary_drv {
 	struct auxiliary_driver adrv;
-	/* This event_handler is meant to be a blocking call.  For instance,
-	 * when a BEFORE_MTU_CHANGE event comes in, the event_handler will not
-	 * return until the auxiliary driver is ready for the MTU change to
-	 * happen.
-	 */
-	void (*event_handler)(struct iidc_core_dev_info *cdev_info,
-			      struct iidc_event *event);
-	int (*vc_receive)(struct iidc_core_dev_info *cdev_info, u32 vf_id,
-			  u8 *msg, u16 len);
 };
 
 #endif /* _IIDC_H_*/

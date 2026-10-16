@@ -46,10 +46,6 @@ static bool en_rem_endpoint_trk;
 module_param(en_rem_endpoint_trk, bool, 0444);
 MODULE_PARM_DESC(en_rem_endpoint_trk, "Remote Endpoint Tracking: 1=enabled (not supported on x722), 0=disabled(default)");
 
-static u8 timer_bucket_slots = 8;
-module_param(timer_bucket_slots, byte, 0444);
-MODULE_PARM_DESC(timer_bucket_slots, "timer_bucket_slots, Range: 3-13, default=8");
-
 static u8 fragment_count_limit = 6;
 module_param(fragment_count_limit, byte, 0444);
 MODULE_PARM_DESC(fragment_count_limit, "adjust maximum values for queue depth and inline data size, default=6, Range: 2-13");
@@ -206,13 +202,6 @@ void irdma_set_rf_user_cfg_params(struct irdma_pci_f *rf)
 	rf->max_rdma_vfs = (rf->rsrc_profile != IRDMA_HMC_PROFILE_DEFAULT) ?
 				max_rdma_vfs : 0;
 	rf->en_rem_endpoint_trk = en_rem_endpoint_trk;
-	rf->timer_slots = timer_bucket_slots;
-	if (!rf->timer_slots)
-		rf->timer_slots = 8;
-	else if (rf->timer_slots < 3)
-		rf->timer_slots = 3;
-	else if (rf->timer_slots > 13)
-		rf->timer_slots = 13;
 	rf->fragcnt_limit = fragment_count_limit;
 	if (rf->fragcnt_limit > 13 || rf->fragcnt_limit < 2) {
 		rf->fragcnt_limit = 6;
@@ -489,6 +478,10 @@ static void irdma_iidc_event_handler(struct iidc_core_dev_info *cdev_info, struc
 		if (iwdev->rf->reset)
 			iwdev->rf->gen_ops.request_reset(iwdev->rf);
 	} else if (*event->type & BIT(IIDC_EVENT_WARN_RESET)) {
+		/* TODO: This gets set from idpf context via the notifier, but is
+		 *       read in a few places in this driver (like AEQ interrupt).
+		 *       Maybe should be protected by a lock.
+		 */
 		iwdev->rf->reset = true;
 	}
 }
@@ -643,7 +636,11 @@ static void irdma_poll_cq3(struct irdma_pci_f *rf)
 	__le64 *cqe;
 	u8 polarity;
 
-	cqe = IRDMA_GET_CURRENT_CQ_ELEM(ukcq);
+	if (ukcq->avoid_mem_cflct)
+		cqe = IRDMA_GET_CURRENT_EXTENDED_CQ_ELEM(ukcq);
+	else
+		cqe = IRDMA_GET_CURRENT_CQ_ELEM(ukcq);
+
 	get_64bit_val(cqe, 24, &qword3);
 	polarity = (u8)FIELD_GET(IRDMA_CQ_VALID, qword3);
 
@@ -651,19 +648,110 @@ static void irdma_poll_cq3(struct irdma_pci_f *rf)
 		cq->ibcq.comp_handler(&cq->ibcq, cq->ibcq.cq_context);
 }
 
+static void ah_purge(struct irdma_device *iwdev)
+{
+	struct list_head *entry;
+	struct list_head *tmp;
+
+	printk(KERN_ERR "Purging all AH entries\n");
+
+	spin_lock(&iwdev->ah_tbl_lock);
+
+	list_for_each_safe(entry, tmp, &iwdev->ah_deletion_list) {
+		struct irdma_ah *ah = container_of(entry, struct irdma_ah,
+						   node);
+		printk(KERN_ERR "Purge AH for PD IDX %u "
+		       "addr: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+		       ah->sc_ah.ah_info.pd_idx,
+		       ah->sc_ah.ah_info.dest_ip_addr[0],
+		       ah->sc_ah.ah_info.dest_ip_addr[1],
+		       ah->sc_ah.ah_info.dest_ip_addr[2],
+		       ah->sc_ah.ah_info.dest_ip_addr[3]);
+
+		irdma_ah_cqp_op(iwdev->rf, &ah->sc_ah, IRDMA_OP_AH_DESTROY,
+				false, NULL, ah);
+
+		irdma_free_rsrc(iwdev->rf, iwdev->rf->allocated_ahs,
+				ah->sc_ah.ah_info.ah_idx);
+
+		hash_del(&ah->list);
+		iwdev->ah_list_cnt--;
+		iwdev->ah_deletion_list_cnt--;
+		list_del(&ah->node);
+		kfree(ah->parent_ah);
+	}
+
+	spin_unlock(&iwdev->ah_tbl_lock);
+}
+
+#define AH_AGE_THRESH_NANOS    5000000000  /* 5 seconds. */
+static void ah_age_out(struct irdma_device *iwdev)
+{
+	u64 now;
+	struct irdma_ah *ah;
+
+	spin_lock(&iwdev->ah_tbl_lock);
+
+	if (list_empty(&iwdev->ah_deletion_list)) {
+		spin_unlock(&iwdev->ah_tbl_lock);
+		return;
+	}
+
+	ah = list_first_entry(&iwdev->ah_deletion_list,
+			      struct irdma_ah,
+			      node);
+
+	/* Read time while holding lock, otherwise, contention
+	 * can result in negative times.
+	 */
+	now = ktime_get_raw_ns();
+
+	if ((now - ah->deletion_timestamp) > AH_AGE_THRESH_NANOS) {
+		irdma_ah_cqp_op(iwdev->rf, &ah->sc_ah, IRDMA_OP_AH_DESTROY,
+				false, NULL, ah);
+
+		irdma_free_rsrc(iwdev->rf, iwdev->rf->allocated_ahs,
+				ah->sc_ah.ah_info.ah_idx);
+
+		hash_del(&ah->list);
+		iwdev->ah_list_cnt--;
+		iwdev->ah_deletion_list_cnt--;
+		list_del(&ah->node);
+		kfree(ah->parent_ah);
+	}
+
+	spin_unlock(&iwdev->ah_tbl_lock);
+}
+
+#define LOW_FREQ_MICROS  1000
+#define HIGH_FREQ_MICROS 25
+
 static int poll_thread(void *context)
 {
 	struct irdma_pci_f *rf = context;
+	u32 sleep_micros = LOW_FREQ_MICROS;
 
 	msleep(200);
+
+	rf->sc_dev.last_cqp_poll_ts = ktime_get_raw_ns();
 	do {
-		msleep(1);
+		usleep_range(sleep_micros, sleep_micros);
+
+		ah_age_out(rf->iwdev);
+
 		if (rf->sc_dev.hw_wa & AEQ_POLL) {
 			irdma_process_aeq(rf);
 			continue;
 		}
 		if (rf->sc_dev.hw_wa & CCQ_CQ3_POLL) {
 			struct irdma_sc_cq *ccq = &rf->ccq.sc_cq;
+
+			const u64 now = ktime_get_raw_ns();
+			const u64 dur = now - rf->sc_dev.last_cqp_poll_ts;
+			if (dur > rf->sc_dev.peak_cqp_poll_interval)
+				rf->sc_dev.peak_cqp_poll_interval = dur;
+
+			rf->sc_dev.last_cqp_poll_ts = now;
 
 			if (ccq)
 				irdma_cqp_ce_handler(rf, ccq);
@@ -676,6 +764,24 @@ static int poll_thread(void *context)
 				irdma_process_ceq(rf, rf->ceqlist);
 			irdma_process_aeq(rf);
 		}
+
+		if (atomic_read(&rf->ceq0_wa_enable)) {
+			struct irdma_sc_cq *ccq = &rf->ccq.sc_cq;
+
+			/* If there is a backlog, poll faster. The high freq
+			 * delay is just enough to allow the user to react to a
+			 * completed request and issue another.
+			 */
+			if (READ_ONCE(rf->sc_dev.cqp->requested_ops) !=
+			    atomic64_read(&rf->sc_dev.cqp->completed_ops))
+				sleep_micros = HIGH_FREQ_MICROS;
+			else
+				sleep_micros = LOW_FREQ_MICROS;
+
+			irdma_process_ceq(rf, rf->ceqlist);
+			irdma_cqp_ce_handler(rf, ccq);
+		}
+
 	} while (!kthread_should_stop());
 
 	return 0;
@@ -694,8 +800,9 @@ static void irdma_remove(struct auxiliary_device *aux_dev)
 	struct irdma_device *iwdev = auxiliary_get_drvdata(aux_dev);
 	u8 rdma_ver = iwdev->rf->rdma_ver;
 
-	if (rdma_ver == IRDMA_GEN_2 && !iwdev->rf->ftype &&
-	    rdma_protocol_roce(&iwdev->ibdev, 1)) {
+	cdev_info->ops->unregister_notifier(cdev_info);
+
+	if (rdma_ver == IRDMA_GEN_2 && !iwdev->rf->ftype) {
 		cancel_delayed_work_sync(&iwdev->rf->dwork_cqp_poll);
 		irdma_free_stag(iwdev->rf->iwdev, iwdev->rf->chk_stag);
 	}
@@ -731,6 +838,8 @@ static void irdma_remove(struct auxiliary_device *aux_dev)
 	}
 
 	irdma_ib_unregister_device(iwdev);
+	/* Delete all AH entries on the age-out list. */
+	ah_purge(iwdev);
 	irdma_unregister_notifiers(iwdev);
 	irdma_deinit_device(iwdev);
 	ib_dealloc_device(&iwdev->ibdev);
@@ -816,10 +925,19 @@ static int irdma_fill_device_info(struct irdma_device *iwdev, struct iidc_core_d
 		rf->gen_ops.register_qset = irdma_lan_register_qset;
 		rf->gen_ops.unregister_qset = irdma_lan_unregister_qset;
 	}
+	#define IRDMA_MEV_B0_RDMA_KEY	0xb
+
+	if (cdev_info->pdev->revision != MEV_PCI_VER_C1) {
+		printk(KERN_ERR "Using MMG workarounds\n");
+		rdma_key = IRDMA_MEV_B0_RDMA_KEY;
+		hw_type_wa = MMG_DEV_00;
+	} else {
+		printk(KERN_ERR "Not using MMG workarounds\n");
+	}
+
 
 	if (rf->rdma_ver >= IRDMA_GEN_3) {
 		if (cdev_info->pdev->revision < MEV_PCI_VER_C0) {
-#define IRDMA_MEV_B0_RDMA_KEY	0xb
 			if (rdma_key != IRDMA_MEV_B0_RDMA_KEY) {
 				dev_err(rf->hw.device,
 					"IRDMA: Invalid RDMA key used for B0\n");
@@ -849,8 +967,9 @@ static int irdma_fill_device_info(struct irdma_device *iwdev, struct iidc_core_d
 	/* Can override limits_sel, protocol_used */
 	irdma_set_rf_user_cfg_params(rf);
 
-	mutex_init(&iwdev->ah_tbl_lock);
-
+	spin_lock_init(&iwdev->ah_tbl_lock);
+	mutex_init(&iwdev->delete_lock);
+	INIT_LIST_HEAD(&iwdev->ah_deletion_list);
 	iwdev->netdev = cdev_info->netdev;
 	iwdev->vsi_num = cdev_info->vport_id;
 	iwdev->init_state = INITIAL_STATE;
@@ -858,7 +977,8 @@ static int irdma_fill_device_info(struct irdma_device *iwdev, struct iidc_core_d
 	iwdev->roce_ackcreds = IRDMA_ROCE_ACKCREDS_DEFAULT;
 	iwdev->rcv_wnd = IRDMA_CM_DEFAULT_RCV_WND_SCALED;
 	iwdev->rcv_wscale = IRDMA_CM_DEFAULT_RCV_WND_SCALE;
-	iwdev->push_mode = false;
+	iwdev->push_mode = iwdev->rf->rdma_ver <= IRDMA_GEN_2 ? false :
+			   FIELD_GET(IRDMA_PUSH_ENA_BIT, rf->sc_dev.vc_caps.feature_cap);
 #if IS_ENABLED(CONFIG_CONFIGFS_FS)
 	iwdev->iwarp_ecn_en = iwdev->rf->rdma_ver == IRDMA_GEN_2 ? true : false;
 	iwdev->iwarp_rtomin = 5;
@@ -887,6 +1007,11 @@ static void irdma_modify_rdpu_bw(struct irdma_pci_f *rf)
 	dev_warn(rf->hw.device, "Set GL_RDPU_CNTRL[%x] = 0x%08X", GL_RDPU_CNTRL, val);
 }
 
+static const struct iidc_notifier_block idc_notifiers = {
+	.event_handler = irdma_iidc_event_handler,
+	.vc_receive = irdma_vchnl_receive,
+};
+
 static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_device_id *id)
 {
 	struct iidc_auxiliary_dev *iidc_adev = container_of(aux_dev,
@@ -898,6 +1023,8 @@ static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_
 	struct irdma_l2params l2params = {};
 	int err;
 	struct irdma_handler *hdl;
+
+	printk(KERN_ERR "AH dedup and deferred deletion enabled (v10)\n");
 
 	if (cdev_info->ver.major != IIDC_MAJOR_VER) {
 		pr_err("version mismatch:\n");
@@ -944,10 +1071,8 @@ static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_
 	if (irdma_fw_major_ver(&rf->sc_dev) == 2 && mod_rdpu_bw)
 		irdma_modify_rdpu_bw(rf);
 
-	if (rf->rdma_ver >= IRDMA_GEN_3 &&
-	    rf->sc_dev.hw_wa & TIMER_NEEDED)
-		rf->poll_thread =
-			kthread_run(poll_thread, rf, "dpc polling thread");
+	rf->poll_thread =
+		kthread_run(poll_thread, rf, "dpc polling thread");
 
 	if (rf->rdma_ver == IRDMA_GEN_2) {
 		if (irdma_set_attr_from_fragcnt(&rf->sc_dev, rf->fragcnt_limit))
@@ -963,11 +1088,6 @@ static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_
 	if (err)
 		goto err_rt_init;
 
-	if (rf->rdma_ver <= IRDMA_GEN_2) {
-		err = irdma_register_notifiers(iwdev);
-		if (err)
-			goto err_notifier_reg;
-	}
 	irdma_add_handler(hdl);
 #ifdef CONFIG_DEBUG_FS
 	irdma_dbg_pf_init(hdl);
@@ -986,8 +1106,7 @@ static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_
 	ibdev_dbg(&iwdev->ibdev, "INIT: Gen[%d] PF[%d] device probe success\n",
 		  rf->rdma_ver, PCI_FUNC(rf->pcidev->devfn));
 
-	if (rf->rdma_ver == IRDMA_GEN_2 && !rf->ftype &&
-	    rdma_protocol_roce(&iwdev->ibdev, 1)) {
+	if (rf->rdma_ver == IRDMA_GEN_2 && !rf->ftype) {
 		INIT_DELAYED_WORK(&rf->dwork_cqp_poll, cqp_poll_worker);
 		rf->chk_stag = irdma_create_stag(rf->iwdev);
 		rf->used_mrs++;
@@ -997,6 +1116,16 @@ static int irdma_probe(struct auxiliary_device *aux_dev, const struct auxiliary_
 
 	auxiliary_set_drvdata(aux_dev, iwdev);
 
+	cdev_info->ops->register_notifier(cdev_info, &idc_notifiers);
+
+	/* Register notifiers after device is fully created. */
+	err = irdma_register_notifiers(iwdev);
+	if (err) {
+		ibdev_err(&iwdev->ibdev, "INIT: Failed to register notifiers\n");
+		irdma_remove(aux_dev);
+		return err;
+	}
+
 	return 0;
 
 err_ibreg:
@@ -1005,7 +1134,6 @@ err_ibreg:
 #endif
 	irdma_del_handler(iwdev->hdl);
 	irdma_unregister_notifiers(iwdev);
-err_notifier_reg:
 	irdma_rt_deinit_hw(iwdev);
 err_rt_init:
 	irdma_ctrl_deinit_hw(rf);
@@ -1038,8 +1166,6 @@ static struct iidc_auxiliary_drv irdma_auxiliary_drv = {
 	    .probe = irdma_probe,
 	    .remove = irdma_remove,
 	},
-	.event_handler = irdma_iidc_event_handler,
-	.vc_receive = irdma_vchnl_receive,
 };
 
 static int __init irdma_init_module(void)

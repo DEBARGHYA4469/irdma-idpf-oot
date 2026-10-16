@@ -98,8 +98,8 @@ enum icrdma_device_caps_const {
 	ICRDMA_MAX_SGE_RD			= 13,
 	ICRDMA_MAX_STATS_COUNT = 128,
 
-	ICRDMA_MAX_IRD_SIZE			= 8,
-	ICRDMA_MAX_ORD_SIZE			= 8,
+	ICRDMA_MAX_IRD_SIZE			= 4,
+	ICRDMA_MAX_ORD_SIZE			= 4,
 	ICRDMA_MIN_WQ_SIZE			= 8 /* WQEs */,
 	ICRDMA_MAX_PUSH_PAGE_COUNT		= 256,
 
@@ -108,7 +108,6 @@ enum icrdma_device_caps_const {
 void icrdma_init_hw(struct irdma_sc_dev *dev);
 void irdma_init_config_check(struct irdma_config_check *cc,
 			     u8 traffic_class,
-			     u8 prio,
 			     u16 qs_handle);
 bool irdma_is_config_ok(struct irdma_config_check *cc, struct irdma_sc_vsi *vsi);
 void irdma_check_fc_for_tc_update(struct irdma_sc_vsi *vsi,

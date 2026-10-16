@@ -21,7 +21,6 @@ int irdma_sc_mr_fast_register(struct irdma_sc_qp *qp,
 			      bool post_sq);
 void irdma_init_config_check(struct irdma_config_check *cc,
 			     u8 traffic_class,
-			     u8 prio,
 			     u16 qs_handle);
 /* HMC/FPM functions */
 int irdma_sc_init_iw_hmc(struct irdma_sc_dev *dev, u16 hmc_fn_id);
@@ -95,7 +94,7 @@ int irdma_get_rdma_features(struct irdma_sc_dev *dev);
 void free_sd_mem(struct irdma_sc_dev *dev);
 int irdma_process_cqp_cmd(struct irdma_sc_dev *dev,
 			  struct cqp_cmds_info *pcmdinfo);
-void irdma_process_bh(struct irdma_sc_dev *dev);
+int irdma_process_bh(struct irdma_sc_dev *dev);
 u8 __iomem *irdma_ioremap_db(struct irdma_sc_dev *dev, u32 size);
 void irdma_iounmap_db(struct irdma_sc_dev *dev);
 void mev_enable_hw_wa(struct irdma_sc_dev *dev, u64 hw_wa,

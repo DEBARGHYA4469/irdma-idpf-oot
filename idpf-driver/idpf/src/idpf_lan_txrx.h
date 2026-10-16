@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 #ifndef _IDPF_LAN_TXRX_H_
 #define _IDPF_LAN_TXRX_H_
@@ -191,6 +191,7 @@ struct idpf_splitq_tx_compl_desc {
 	} q_head_compl_tag;
 	u8 ts[3];
 	u8 rsvd; /* Reserved */
+
 };/* writeback used with completion queues*/
 
 /* Context descriptors */

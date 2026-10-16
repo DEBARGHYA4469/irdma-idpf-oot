@@ -1627,8 +1627,8 @@ void irdma_get_vlan_mac_ipv6(u32 *addr, u16 *vlan_id, u8 *mac)
  */
 u16 irdma_get_vlan_ipv4(u32 *addr)
 {
-	u16 vlan_id = 0xFFFF;
 	struct net_device *netdev;
+	u16 vlan_id = 0xFFFF;
 
 	netdev = ip_dev_find(&init_net, htonl(addr[0]));
 	if (netdev) {
@@ -3488,29 +3488,11 @@ static void dump_qp_ae_info(struct irdma_qp *iwqp)
 
 		return;
 	}
-	switch (ae) {
-	case IRDMA_AE_BAD_CLOSE:
-	case IRDMA_AE_LLP_CLOSE_COMPLETE:
-	case IRDMA_AE_LLP_CONNECTION_RESET:
-	case IRDMA_AE_LLP_FIN_RECEIVED:
-	case IRDMA_AE_LLP_SYN_RECEIVED:
-	case IRDMA_AE_LLP_TERMINATE_RECEIVED:
-	case IRDMA_AE_LLP_DOUBT_REACHABILITY:
-	case IRDMA_AE_LLP_CONNECTION_ESTABLISHED:
-	case IRDMA_AE_RESET_SENT:
-	case IRDMA_AE_TERMINATE_SENT:
-	case IRDMA_AE_RESET_NOT_SENT:
-		ibdev_dbg(&iwdev->ibdev,
-			  "AEQ: qp async avent qp_id = %d, ae = 0x%x (%s), src = %d, ae_cnt = %d\n",
-			  iwqp->sc_qp.qp_uk.qp_id, ae, irdma_get_ae_desc(ae),
-			  iwqp->ae_src, atomic_read(&ae_info->ae_cnt));
-		break;
-	default:
-		ibdev_err(&iwdev->ibdev,
-			  "qp async event qp_id = %d, ae = 0x%x (%s), src = %d, ae_cnt = %d\n",
-			  iwqp->sc_qp.qp_uk.qp_id, ae, irdma_get_ae_desc(ae),
-			  iwqp->ae_src, atomic_read(&ae_info->ae_cnt));
-	}
+
+	ibdev_err(&iwdev->ibdev,
+		  "qp async event qp_id = %d, ae = 0x%x (%s), src = %d, ae_cnt = %d\n",
+		  iwqp->sc_qp.qp_uk.qp_id, ae, irdma_get_ae_desc(ae),
+		  iwqp->ae_src, atomic_read(&ae_info->ae_cnt));
 }
 
 /**
@@ -3540,7 +3522,7 @@ static void irdma_cm_disconn_true(struct irdma_qp *iwqp)
 	if (rdma_protocol_roce(&iwdev->ibdev, 1)) {
 		struct ib_qp_attr attr;
 
-		if (atomic_read(&iwqp->flush_issued) ||
+		if (iwqp->flush_oneshot ||
 		    iwqp->sc_qp.qp_uk.destroy_pending) {
 			spin_unlock_irqrestore(&iwqp->lock, flags);
 			return;
@@ -3564,8 +3546,10 @@ static void irdma_cm_disconn_true(struct irdma_qp *iwqp)
 		issue_close = 1;
 		iwqp->cm_id = NULL;
 		irdma_terminate_del_timer(qp);
-		if (!atomic_read(&iwqp->flush_issued))
+		if (!iwqp->flush_oneshot) {
+			iwqp->flush_oneshot = true;
 			issue_flush = 1;
+		}
 	} else if ((original_hw_tcp_state == IRDMA_TCP_STATE_CLOSE_WAIT) ||
 		   ((original_ibqp_state == IB_QPS_RTS) &&
 		    (last_ae == IRDMA_AE_LLP_CONNECTION_RESET))) {
@@ -3582,8 +3566,10 @@ static void irdma_cm_disconn_true(struct irdma_qp *iwqp)
 		issue_close = 1;
 		iwqp->cm_id = NULL;
 		qp->term_flags = 0;
-		if (!atomic_read(&iwqp->flush_issued))
+		if (!iwqp->flush_oneshot) {
+			iwqp->flush_oneshot = true;
 			issue_flush = 1;
+		}
 	}
 
 	spin_unlock_irqrestore(&iwqp->lock, flags);

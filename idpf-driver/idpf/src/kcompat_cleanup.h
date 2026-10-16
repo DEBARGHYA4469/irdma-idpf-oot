@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-/* Copyright (C) 2019-2025 Intel Corporation */
+/* Copyright (C) 2019-2024 Intel Corporation */
 
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _KCOMPAT_CLEANUP_H_
@@ -10,19 +10,9 @@
 #ifndef typeof_member
 #define typeof_member(T, m)     typeof(((T*)0)->m)
 #endif
-#ifndef GCC_VERSION
-#define GCC_VERSION (__GNUC__ * 10000		\
-		     + __GNUC_MINOR__ * 100	\
-		     + __GNUC_PATCHLEVEL__)
-#endif /* GCC_VERSION */
-#define GCC_IS_BELOW(x) (GCC_VERSION < (x))
 
 #if defined __has_attribute
 #if __has_attribute(cleanup)
-#define HAVE_ATTRIBUTE_CLEANUP
-#endif
-#else
-#if !GCC_IS_BELOW(30306)
 #define HAVE_ATTRIBUTE_CLEANUP
 #endif
 #endif
@@ -373,9 +363,5 @@ DEFINE_LOCK_GUARD_1(write_lock_irqsave, rwlock_t,
 #include <linux/rcupdate.h>
 
 DEFINE_LOCK_GUARD_0(rcu, rcu_read_lock(), rcu_read_unlock())
-
-#include <linux/devlink.h>
-
-DEFINE_GUARD(devl, struct devlink *, devl_lock(_T), devl_unlock(_T));
 
 #endif /* _KCOMPAT_CLENAUP_H_ */
